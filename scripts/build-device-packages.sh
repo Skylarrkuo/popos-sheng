@@ -45,15 +45,36 @@ firmware=$stage/firmware/usr/lib/firmware
 mkdir -p "$firmware/updates"
 tar -xzf "$repo/inputs/sheng-firmware.tar.gz" --strip-components=1 --no-same-owner -C "$firmware/updates"
 mv "$firmware/updates/fpcsheng.elf" "$firmware/fpcsheng.elf"
+devauth=qcom/sm8550/sheng/devauth.mbn
+install -d -m 0755 "$firmware/$(dirname "$devauth")"
+ln -s "../../../updates/$devauth" "$firmware/$devauth"
+test -s "$firmware/$devauth"
 test -s "$firmware/fpcsheng.elf"
 test -d "$firmware/updates/ath12k/WCN7850"
 test -d "$firmware/updates/cirrus"
 mkdir -p "$stage/audio/usr/share/alsa"
 cp -a "$stage/port/alsa-xiaomi-sheng/usr/share/alsa/ucm2" "$stage/audio/usr/share/alsa/"
+ucm=$stage/audio/usr/share/alsa/ucm2/conf.d/sm8550/Xiaomi-Pad6SPro.conf
+ucm_target=../../Xiaomi/sheng/Xiaomi-Pad6SPro.conf
+if [[ -L $ucm ]]; then
+    test "$(readlink "$ucm")" = "$ucm_target"
+else
+    test "$(cat "$ucm")" = "$ucm_target"
+    ln -sfn "$ucm_target" "$ucm"
+fi
+test -s "$ucm"
+install -d -m 0755 "$stage/audio/usr/lib/modules-load.d"
+printf 'snd_soc_wcd938x\n' > "$stage/audio/usr/lib/modules-load.d/popos-sheng-audio.conf"
+
+install -d -m 0755 "$stage/platform/DEBIAN"
+install -Dm0755 "$repo/scripts/overlays/popos-sheng-mipps-pd" \
+    "$stage/platform/usr/libexec/popos-sheng-mipps-pd"
+install -Dm0644 "$repo/scripts/overlays/mipps-pd.conf" \
+    "$stage/platform/usr/lib/systemd/system/xiaomi-mipps-auth.service.d/sheng-pd.conf"
 
 cat > "$stage/firmware/DEBIAN/control" <<'EOF'
 Package: firmware-popos-sheng
-Version: 1.0+053da477
+Version: 1.0+053da477+poposheng1
 Architecture: all
 Maintainer: Pop!_OS Sheng local build <local@sheng.invalid>
 Section: kernel
@@ -64,7 +85,7 @@ Description: Firmware overlays for Xiaomi Pad 6S Pro
 EOF
 cat > "$stage/audio/DEBIAN/control" <<'EOF'
 Package: alsa-ucm-popos-sheng
-Version: 1.0+eaff0351
+Version: 1.0+eaff0351+poposheng1
 Architecture: all
 Maintainer: Pop!_OS Sheng local build <local@sheng.invalid>
 Depends: alsa-ucm-conf
@@ -73,11 +94,22 @@ Priority: optional
 Description: ALSA UCM profiles for the Xiaomi Pad 6S Pro audio card
  Profiles sourced from the Sheng Ubuntu port.
 EOF
-firmware_deb=firmware-popos-sheng_1.0+053da477_all.deb
-audio_deb=alsa-ucm-popos-sheng_1.0+eaff0351_all.deb
-dpkg-deb -Zxz -z3 --build --root-owner-group "$stage/firmware" "$pool/$firmware_deb.partial"
-dpkg-deb -Zxz -z3 --build --root-owner-group "$stage/audio" "$pool/$audio_deb.partial"
-mv "$pool/$firmware_deb.partial" "$pool/$firmware_deb"
-mv "$pool/$audio_deb.partial" "$pool/$audio_deb"
-device_packages+=("$firmware_deb" "$audio_deb")
+cat > "$stage/platform/DEBIAN/control" <<'EOF'
+Package: popos-sheng-platform
+Version: 1.0
+Architecture: all
+Maintainer: Pop!_OS Sheng local build <local@sheng.invalid>
+Depends: xiaomi-mipps-auth
+Section: admin
+Priority: optional
+Description: Xiaomi Pad 6S Pro platform configuration for Pop!_OS
+ Start MiPPS partner authentication once USB Power Delivery is available.
+EOF
+for component in firmware audio platform; do
+    dpkg-deb -Zxz -z3 --build --root-owner-group "$stage/$component" "$stage"
+done
+for deb in "$stage"/*.deb; do
+    mv -- "$deb" "$pool/"
+    device_packages+=("$(basename "$deb")")
+done
 printf '%s\n' "${device_packages[@]}" > "$work/device-debs.txt"

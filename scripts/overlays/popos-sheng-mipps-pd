@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# Partner detection and PD negotiation can finish after the attach event.
+for attempt in 1 2 3 4 5 6; do
+    for partner in /sys/class/typec/port*-partner/supports_usb_power_delivery; do
+        [ -r "$partner" ] || continue
+        if read -r supported < "$partner" && [ "$supported" = yes ]; then
+            exit 0
+        fi
+    done
+    for supply in /sys/class/power_supply/qcom-battmgr-usb /sys/class/power_supply/ucsi-source-psy-*; do
+        [ -r "$supply/usb_type" ] || continue
+        if read -r usb_type < "$supply/usb_type"; then
+            case "$usb_type" in
+                *'[PD]'*|*'[PD_PPS]'*|*'[PD_DRP]'*) exit 0 ;;
+            esac
+        fi
+    done
+    [ "$attempt" = 6 ] || sleep 1
+done
+
+echo 'Skipping MiPPS authentication because no USB Power Delivery partner is ready.'
+exit 1

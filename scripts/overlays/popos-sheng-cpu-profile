@@ -1,0 +1,150 @@
+#!/usr/bin/python3
+import fcntl
+import json
+from pathlib import Path
+import sys
+import time
+
+
+CPUFREQ = Path("/sys/devices/system/cpu/cpufreq")
+THERMAL = Path("/sys/class/thermal")
+BASELINE = Path("/etc/tuned/sheng-cpu-baseline.json")
+RUNTIME = Path("/run/popos-sheng-cpu")
+ACTIVE = RUNTIME / "profile"
+FIELDS = (
+    "boost",
+    "policy7/boost",
+    "policy3/scaling_min_freq",
+    "policy3/scaling_max_freq",
+    "policy7/scaling_max_freq",
+)
+PROFILES = {
+    "sheng-power-saver": dict(zip(FIELDS, (0, 0, 499200, 2188800, 2342400))),
+    "sheng-balanced": dict(zip(FIELDS, (0, 0, 614400, 2803200, 2956800))),
+    "sheng-performance": dict(zip(FIELDS, (1, 1, 614400, 2803200, 3187200))),
+}
+
+
+def read(field):
+    return (CPUFREQ / field).read_text().strip()
+
+
+def snapshot():
+    return {field: int(read(field)) for field in FIELDS}
+
+
+def check_platform():
+    compatibles = Path("/sys/firmware/devicetree/base/compatible").read_bytes().split(b"\0")
+    if b"xiaomi,sheng" not in compatibles:
+        raise ValueError("Unsupported device")
+    for policy, cpus in (("policy0", "0 1 2"), ("policy3", "3 4 5 6"), ("policy7", "7")):
+        if read(policy + "/related_cpus") != cpus or read(policy + "/scaling_driver") != "qcom-cpufreq-hw":
+            raise ValueError(f"Unexpected CPU topology for {policy}")
+        if read(policy + "/scaling_governor") != "schedutil":
+            raise ValueError(f"{policy} requires schedutil")
+    if "3187200" not in read("policy7/scaling_boost_frequencies").split():
+        raise ValueError("X3 3187200 kHz boost is unavailable")
+
+
+def write(field, value):
+    (CPUFREQ / field).write_text(f"{value}\n")
+
+
+def thermal_cap_active(cpu):
+    for device in THERMAL.glob("cooling_device*"):
+        if (device / "type").read_text().strip() == f"cpufreq-cpu{cpu}":
+            return int((device / "cur_state").read_text()) > 0
+    return False
+
+
+def verify(target):
+    actual = snapshot()
+    # The thermal framework can temporarily impose a lower ceiling.
+    for cpu in (3, 7):
+        field = f"policy{cpu}/scaling_max_freq"
+        if actual[field] < target[field] and thermal_cap_active(cpu):
+            actual[field] = target[field]
+    return actual == target
+
+
+def set_policy(target):
+    if target["boost"]:
+        write("boost", 1)
+        write("policy7/boost", target["policy7/boost"])
+
+    mid_min = "policy3/scaling_min_freq"
+    mid_max = "policy3/scaling_max_freq"
+    if int(read(mid_min)) > target[mid_max]:
+        write(mid_min, target[mid_min])
+        write(mid_max, target[mid_max])
+    else:
+        write(mid_max, target[mid_max])
+        write(mid_min, target[mid_min])
+    write("policy7/scaling_max_freq", target["policy7/scaling_max_freq"])
+
+    if not target["boost"]:
+        write("boost", 0)
+    for _ in range(15):
+        if verify(target):
+            return
+        time.sleep(0.05)
+    raise ValueError(f"CPU readback mismatch: {snapshot()}")
+
+
+def apply(target, rollback):
+    try:
+        set_policy(target)
+    except (OSError, ValueError):
+        set_policy(rollback)
+        raise
+
+
+def main():
+    check_platform()
+    args = sys.argv[1:]
+    if args == ["snapshot"]:
+        print(json.dumps(snapshot(), indent=2))
+        return
+
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    with (RUNTIME / "lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        baseline = json.loads(BASELINE.read_text())
+        active = ACTIVE.read_text().strip() if ACTIVE.exists() else None
+        previous = PROFILES[active] if active else baseline
+        if args == ["resume"]:
+            if active:
+                apply(previous, baseline)
+            return
+        if args == ["restore"]:
+            apply(baseline, previous)
+            ACTIVE.unlink(missing_ok=True)
+            return
+
+        name, action = args[:2]
+        target = PROFILES[name]
+        if action == "start":
+            apply(target, previous)
+            staged = ACTIVE.with_suffix(".new")
+            try:
+                staged.write_text(name + "\n")
+                staged.replace(ACTIVE)
+            except OSError:
+                apply(previous, target)
+                raise
+        elif action == "stop":
+            if active == name:
+                apply(baseline, previous)
+                ACTIVE.unlink()
+        elif action == "verify":
+            if active != name or not verify(target):
+                raise ValueError(f"{name} is not applied")
+        else:
+            raise ValueError(f"Unsupported action: {action}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyError, OSError, ValueError) as error:
+        sys.exit(str(error))

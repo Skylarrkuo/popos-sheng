@@ -52,10 +52,11 @@ inside() {
     chroot "$root" /usr/bin/env LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive "$@"
 }
 
-if [[ ! -f $binfmt/qemu-aarch64 ]]; then
-    emulator=$(command -v qemu-aarch64-static || :)
+if [[ $(uname -m) != aarch64 && ! -f $binfmt/qemu-aarch64 ]]; then
+    emulator=${SHENG_POP_QEMU_AARCH64:-$(command -v qemu-aarch64-static || :)}
     if [[ -z $emulator ]]; then
-        emulator=/var/tmp/sheng-trixie-gnome-20261125/emulator/usr/bin/qemu-aarch64-static
+        echo 'Install qemu-user-static or set SHENG_POP_QEMU_AARCH64 to a static ARM64 emulator.' >&2
+        exit 1
     fi
     test -x "$emulator"
     magic='\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00'
@@ -109,6 +110,12 @@ if [[ ! -f $work/device-configured ]]; then
     for deb in "${requested[@]}"; do rm -- "$root$deb"; done
     rmdir "$root$stage"
 
+    # The Android boot image is maintained separately from the Ubuntu kernel hooks.
+    install -d -m 0755 "$root/etc/flash-kernel"
+    printf 'none\n' > "$root/etc/flash-kernel/machine"
+    inside apt-get "${apt_options[@]}" --no-install-recommends -y install \
+        power-profiles-daemon system76-power-
+
     echo '[Image 2/4] Set up the COSMIC greeter and the existing dual-boot linux partition'
     inside id "$username" >/dev/null 2>&1 || inside useradd -m -s /bin/bash -G sudo "$username"
     printf '%s:%s\n' "$username" "${SHENG_INITIAL_PASSWORD:-$username}" | inside chpasswd
@@ -119,6 +126,7 @@ if [[ ! -f $work/device-configured ]]; then
         printf '127.0.1.1 popos-sheng\n' >> "$root/etc/hosts"
     fi
     printf 'PARTLABEL=linux / ext4 defaults,x-systemd.growfs 0 1\n' > "$root/etc/fstab"
+    systemctl --root "$root" mask systemd-networkd-wait-online.service
     printf 'CHASSIS=tablet\nHARDWARE_VENDOR=Xiaomi\nHARDWARE_MODEL="Pad 6S Pro 12.4"\n' > "$root/etc/machine-info"
     sed -i -E 's/^# ?(zh_CN.UTF-8 UTF-8)$/\1/' "$root/etc/locale.gen"
     inside locale-gen zh_CN.UTF-8
@@ -156,13 +164,17 @@ if [[ $mode == full ]]; then
     done
     test -s "$root/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so"
     test -s "$root/usr/share/alsa/ucm2/Xiaomi/sheng/HiFi.conf"
+    test -L "$root/usr/share/alsa/ucm2/conf.d/sm8550/Xiaomi-Pad6SPro.conf"
+    grep -Fxq snd_soc_wcd938x "$root/usr/lib/modules-load.d/popos-sheng-audio.conf"
+    test -s "$root/usr/lib/firmware/qcom/sm8550/sheng/devauth.mbn"
+    grep -Fxq none "$root/etc/flash-kernel/machine"
     grep -Fxq 'PARTLABEL=linux / ext4 defaults,x-systemd.growfs 0 1' "$root/etc/fstab"
     test "$(readlink "$root/etc/systemd/system/display-manager.service")" = /lib/systemd/system/cosmic-greeter.service
     inside /lib/ld-linux-aarch64.so.1 --list /usr/bin/cosmic-comp > "$output/cosmic-library-check.txt"
     inside dpkg --audit | tee "$output/dpkg-audit.txt"
     test ! -s "$output/dpkg-audit.txt"
     inside apt-get check
-    packages=(cosmic-session cosmic-comp cosmic-greeter mesa-vulkan-drivers pop-desktop upower \
+    packages=(cosmic-session cosmic-comp cosmic-greeter mesa-vulkan-drivers pop-desktop upower power-profiles-daemon \
         v4l-utils libcamera-tools libspa-0.2-libcamera)
     while IFS= read -r name; do
         packages+=("$(dpkg-deb -f "$pool/$name" Package)")
@@ -187,13 +199,27 @@ fi
 
 echo '[Image 4/4] Check ext4, pack the sparse image, and verify the round trip'
 e2fsck -fn "$image"
-img2simg "$image" "$work/$sparse" 4096
-simg2img "$work/$sparse" "$work/roundtrip.ext4"
-cmp "$image" "$work/roundtrip.ext4"
-rm -- "$work/roundtrip.ext4"
-cp "$work/$sparse" "$output/$sparse.partial"
-mv "$output/$sparse.partial" "$output/$sparse"
+if [[ ${SHENG_POP_COMPRESS_ROOTFS:-0} == 1 ]]; then
+    packed=$sparse.zst
+    img2simg "$image" - 4096 | zstd -q -T2 -3 > "$output/$packed.partial"
+    zstd -dc -- "$output/$packed.partial" | python3 "$repo/scripts/verify-images.py" \
+        "$output" --sparse - --raw-rootfs "$image"
+    mv "$output/$packed.partial" "$output/$packed"
+    (
+        cd "$output"
+        sha256sum -- "$boot" "$packed" > SHA256SUMS.download
+        sha256sum -- "$boot" > SHA256SUMS
+        digest=$(zstd -dc -- "$packed" | sha256sum)
+        printf '%s  %s\n' "${digest%% *}" "$sparse" >> SHA256SUMS
+    )
+else
+    packed=$sparse
+    img2simg "$image" "$output/$sparse.partial" 4096
+    python3 "$repo/scripts/verify-images.py" "$output" \
+        --sparse "$output/$sparse.partial" --raw-rootfs "$image"
+    mv "$output/$sparse.partial" "$output/$sparse"
+    (cd "$output" && sha256sum -- "$boot" "$sparse" > SHA256SUMS && sha256sum -c SHA256SUMS)
+fi
 cp "$repo/"{sources.tsv,device-sources.tsv} "$output/"
 cp "$work/iso-packages.tsv" "$output/"
-(cd "$output" && sha256sum -- "$boot" "$sparse" > SHA256SUMS && sha256sum -c SHA256SUMS)
-ls -lh "$output/$boot" "$output/$sparse"
+ls -lh "$output/$boot" "$output/$packed"

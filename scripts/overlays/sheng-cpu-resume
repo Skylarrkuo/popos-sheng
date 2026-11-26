@@ -1,0 +1,5 @@
+#!/bin/sh
+
+if [ "$1" = post ] && [ -r /run/popos-sheng-cpu/profile ]; then
+    exec /usr/libexec/popos-sheng-cpu-profile resume
+fi

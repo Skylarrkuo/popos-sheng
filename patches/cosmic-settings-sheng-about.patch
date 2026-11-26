@@ -1,0 +1,217 @@
+--- a/cosmic-settings/src/pages/system/info.rs
++++ b/cosmic-settings/src/pages/system/info.rs
+@@ -5,6 +5,7 @@
+ use cosmic::iced::wgpu;
+ use std::collections::{HashMap, HashSet};
+ use std::ffi::OsStr;
++use std::path::Path;
+ use std::process::Command;
+ 
+ #[must_use]
+@@ -16,6 +17,9 @@
+     pub processor: String,
+     pub graphics: Vec<String>,
+     pub disk_capacity: String,
++    pub system_partition_capacity: Option<String>,
++    pub integrated_display: Option<String>,
++    pub battery_design_capacity: Option<String>,
+     pub operating_system: String,
+     pub os_architecture: String,
+     pub kernel_version: String,
+@@ -201,15 +205,34 @@
+             info.graphics = Self::wgpu_graphics().await;
+         }
+ 
++        if is_sheng() {
++            info.processor = fl!("about-sheng-processor");
++            info.graphics.retain(|name| {
++                let name = name.to_ascii_lowercase();
++                !name.contains("adreno") && !name.contains("freedreno") && !name.contains("fd740")
++            });
++            info.graphics.insert(0, "Qualcomm Adreno 740".into());
++            if let Some(capacity) = root_ufs_capacity() {
++                info.disk_capacity = format!("UFS · {}", format_size(capacity));
++                info.system_partition_capacity = disks
++                    .list()
++                    .iter()
++                    .find(|disk| disk.mount_point() == Path::new("/"))
++                    .map(|disk| format_size(disk.total_space()));
++            }
++            info.integrated_display = sheng_display();
++            info.battery_design_capacity = sheng_battery_design_capacity();
++        }
++
+         info
+     }
+ }
+ 
+ fn architecture() -> String {
+     read_to_string("/proc/sys/kernel/arch")
+-        .unwrap_or_default()
+-        .trim()
+-        .to_string()
++        .map(|arch| arch.trim().to_string())
++        .filter(|arch| !arch.is_empty())
++        .unwrap_or_else(|| std::env::consts::ARCH.into())
+ }
+ 
+ fn kernel_version() -> String {
+@@ -227,8 +250,11 @@
+         .unwrap_or_default();
+ 
+     if sys_vendor.is_empty() {
+-        // Fallback to sysinfo if DMI information is not available
+-        return sysinfo::Product::name().unwrap_or_default();
++        return read_to_string("/sys/firmware/devicetree/base/model")
++            .map(|name| name.trim_matches('\0').trim().to_string())
++            .filter(|name| !name.is_empty())
++            .or_else(sysinfo::Product::name)
++            .unwrap_or_default();
+     }
+ 
+     let mut model = sys_vendor.clone();
+@@ -257,6 +283,64 @@
+     }
+ 
+     model
++}
++
++fn is_sheng() -> bool {
++    std::fs::read("/sys/firmware/devicetree/base/compatible").is_ok_and(|compatible| {
++        compatible
++            .split(|&byte| byte == 0)
++            .any(|entry| entry == b"xiaomi,sheng")
++    })
++}
++
++fn root_ufs_capacity() -> Option<u64> {
++    let mounts = read_to_string("/proc/self/mountinfo")?;
++    let device = mounts.lines().find_map(|line| {
++        let mut fields = line.split_ascii_whitespace();
++        let device = fields.nth(2)?;
++        (fields.nth(1)? == "/").then_some(device)
++    })?;
++    let block = std::fs::canonicalize(format!("/sys/dev/block/{device}")).ok()?;
++    let disk = if block.join("partition").is_file() {
++        block.parent()?
++    } else {
++        &block
++    };
++    let is_ufs = disk.ancestors().any(|path| {
++        std::fs::read_link(path.join("driver"))
++            .ok()
++            .is_some_and(|driver| driver.file_name() == Some(OsStr::new("ufshcd-qcom")))
++    });
++    if !is_ufs {
++        return None;
++    }
++    // Linux exposes block device size in 512-byte sectors.
++    read_to_string(disk.join("size"))?
++        .trim()
++        .parse::<u64>()
++        .ok()?
++        .checked_mul(512)
++}
++
++fn sheng_display() -> Option<String> {
++    std::fs::read_dir("/sys/class/drm")
++        .ok()?
++        .flatten()
++        .find_map(|connector| {
++            if !connector.file_name().to_str()?.contains("-DSI-") {
++                return None;
++            }
++            let modes = read_to_string(connector.path().join("modes"))?;
++            let (width, height) = modes.lines().next()?.split_once('x')?;
++            let (width, height) = (width.parse::<u32>().ok()?, height.parse::<u32>().ok()?);
++            Some(format!("12.4″ · {width} × {height}"))
++        })
++}
++
++fn sheng_battery_design_capacity() -> Option<String> {
++    let charge = read_to_string("/sys/class/power_supply/qcom-battmgr-bat/charge_full_design")?;
++    let mah = charge.trim().parse::<u64>().ok()? / 1000;
++    (mah > 0).then(|| format!("{mah} mAh"))
+ }
+ 
+ fn operating_system() -> String {
+--- a/cosmic-settings/src/pages/system/about.rs
++++ b/cosmic-settings/src/pages/system/about.rs
+@@ -202,6 +202,10 @@
+         processor = fl!("about-hardware", "processor");
+         graphics = fl!("about-hardware", "graphics");
+         disk_capacity = fl!("about-hardware", "disk-capacity");
++        internal_storage = fl!("about-hardware", "internal-storage");
++        system_partition = fl!("about-hardware", "system-partition");
++        integrated_display = fl!("about-hardware", "integrated-display");
++        battery_design_capacity = fl!("about-hardware", "battery-design-capacity");
+     });
+ 
+     Section::default()
+@@ -232,15 +236,30 @@
+                 );
+             }
+ 
+-            section_builder
+-                .add(
+-                    settings::flex_item(
+-                        &*desc[disk_capacity],
+-                        text::body(&page.info.disk_capacity),
+-                    )
++            let storage_label = if page.info.system_partition_capacity.is_some() {
++                internal_storage
++            } else {
++                disk_capacity
++            };
++            section_builder = section_builder.add(
++                settings::flex_item(&*desc[storage_label], text::body(&page.info.disk_capacity))
+                     .align_items(Alignment::Center),
+-                )
+-                .into()
++            );
++
++            for (label, value) in [
++                (system_partition, &page.info.system_partition_capacity),
++                (integrated_display, &page.info.integrated_display),
++                (battery_design_capacity, &page.info.battery_design_capacity),
++            ] {
++                if let Some(value) = value {
++                    section_builder = section_builder.add(
++                        settings::flex_item(&*desc[label], text::body(value.as_str()))
++                            .align_items(Alignment::Center),
++                    );
++                }
++            }
++
++            section_builder.into()
+         })
+ }
+ 
+--- a/i18n/en/cosmic_settings.ftl
++++ b/i18n/en/cosmic_settings.ftl
+@@ -1101,6 +1101,11 @@
+     .processor = Processor
+     .graphics = Graphics
+     .disk-capacity = Disk capacity
++    .internal-storage = Internal storage
++    .system-partition = Pop!_OS partition
++    .integrated-display = Built-in display
++    .battery-design-capacity = Battery design capacity
++about-sheng-processor = Qualcomm Snapdragon 8 Gen 2 (SM8550) · 8 cores
+ 
+ about-os = Operating system
+     .os = Operating system
+--- a/i18n/zh-CN/cosmic_settings.ftl
++++ b/i18n/zh-CN/cosmic_settings.ftl
+@@ -862,6 +862,11 @@
+     .processor = 处理器
+     .graphics = 图形处理器
+     .disk-capacity = 磁盘容量
++    .internal-storage = 内置存储
++    .system-partition = Pop!_OS 分区
++    .integrated-display = 内置屏幕
++    .battery-design-capacity = 电池设计容量
++about-sheng-processor = Qualcomm 骁龙 8 Gen 2（SM8550） · 8 核
+ about-os = 操作系统
+     .os = 操作系统
+     .os-architecture = 操作系统架构

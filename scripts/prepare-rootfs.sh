@@ -6,7 +6,12 @@ if [[ ${1:-} != --private ]]; then
 fi
 shift
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
-iso=${1:-$repo/../pop-os_26.04_arm64_generic_1.iso}
+iso_name=pop-os_26.04_arm64_generic_1.iso
+default_iso=$repo/inputs/$iso_name
+if [[ -f $repo/../$iso_name ]]; then default_iso=$repo/../$iso_name; fi
+iso=${1:-${SHENG_POP_ISO:-$default_iso}}
+iso_hash=$(awk -F '\t' -v name="$iso_name" '$1 == name {print $2}' "$repo/sources.tsv")
+[[ $iso_hash =~ ^[[:xdigit:]]{64}$ ]]
 work=${SHENG_POP_WORK:-/var/tmp/popos-sheng-26.04}
 output=$repo/out
 root=$work/rootfs
@@ -29,7 +34,7 @@ if [[ -f $work/iso-ready && -s $image ]]; then
     exit 0
 fi
 echo '[Rootfs 1/2] Verify official Pop!_OS 26.04 ARM64 ISO'
-printf 'b0fc96d609ba62e9374a42724fae0320144961a36be6a02370b5076a337df5b8  %s\n' "$iso" | sha256sum -c -
+printf '%s  %s\n' "$iso_hash" "$iso" | sha256sum -c -
 mkdir -p "$root" "$iso_mount"
 mount -o loop,ro "$iso" "$iso_mount"
 mapfile -t squashfs < <(find "$iso_mount" -name filesystem.squashfs -type f)
@@ -49,6 +54,7 @@ df -h "$root"
 sync -f "$root"
 umount "$root"
 umount "$iso_mount"
+rm -f -- "$work/device-configured"
 mv "$image.partial" "$image"
 touch "$work/iso-ready"
 echo 'Official Pop!_OS COSMIC root filesystem prepared'

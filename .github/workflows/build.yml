@@ -1,0 +1,115 @@
+name: Build Pop!_OS for Sheng
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: Optional HTTPS mirror for the pinned System76 ARM64 ISO
+        type: string
+        required: false
+      upload_images:
+        description: Upload the boot image and compressed rootfs as an artifact
+        type: boolean
+        default: true
+      qemu_smoke_test:
+        description: Boot the Pop!_OS rootfs on a generic ARM64 QEMU machine
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        env:
+          QEMU_SMOKE_TEST: ${{ inputs.qemu_smoke_test }}
+        run: |
+          sudo apt-get update
+          packages=(bc bison build-essential clang cpio curl device-tree-compiler
+            dpkg-dev e2fsprogs file flex gnupg kmod libelf-dev libssl-dev lld
+            llvm lz4 python3 rsync squashfs-tools xz-utils zstd android-sdk-libsparse-utils)
+          if [[ $QEMU_SMOKE_TEST == true ]]; then packages+=(qemu-system-arm); fi
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          sudo apt-get clean
+          printf 'SHENG_POP_WORK=%s\n' "$RUNNER_TEMP/popos-sheng" >> "$GITHUB_ENV"
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+
+      - name: Download and verify pinned sources
+        env:
+          SHENG_POP_ISO_URL: ${{ inputs.iso_url }}
+        run: bash scripts/fetch-inputs.sh
+
+      - name: Compile and package the Sheng kernel
+        run: |
+          sudo env SHENG_POP_WORK="$SHENG_POP_WORK" SHENG_POP_JOBS="$(nproc)" \
+            bash scripts/build-kernel.sh
+          test "$SHENG_POP_WORK" = "$RUNNER_TEMP/popos-sheng"
+          sudo rm -r -- "$SHENG_POP_WORK/kernel-src" "$SHENG_POP_WORK/kernel-build"
+          df -h "$SHENG_POP_WORK"
+
+      - name: Extract the Pop!_OS ARM64 system and build device packages
+        run: |
+          sudo env SHENG_POP_WORK="$SHENG_POP_WORK" SHENG_POP_UNSQUASH_JOBS="$(nproc)" \
+            bash scripts/prepare-rootfs.sh
+          rm -- inputs/pop-os_26.04_arm64_generic_1.iso
+          sudo env SHENG_POP_WORK="$SHENG_POP_WORK" bash scripts/build-device-packages.sh
+
+      - name: Build and verify the compressed flash image
+        run: |
+          sudo env SHENG_POP_WORK="$SHENG_POP_WORK" SHENG_POP_COMPRESS_ROOTFS=1 \
+            bash scripts/build-image.sh
+          sudo env SHENG_POP_WORK="$SHENG_POP_WORK" bash scripts/publish-local-apt.sh
+          (cd out && sha256sum -c SHA256SUMS.download)
+
+      - name: Boot generic ARM64 in QEMU
+        if: inputs.qemu_smoke_test
+        run: |
+          gzip -dc out/kernel/Image.gz > "$RUNNER_TEMP/sheng-Image"
+          sudo python3 scripts/smoke-boot.py "$SHENG_POP_WORK/rootfs.ext4" \
+            "$RUNNER_TEMP/sheng-Image" "$(cat out/kernelrelease.txt)" --timeout 300 \
+            | tee out/qemu-smoke.log
+
+      - name: Upload flash images
+        if: inputs.upload_images
+        uses: actions/upload-artifact@v7
+        with:
+          name: sheng-popos-26.04-arm64-images
+          path: |
+            out/boot-popos-sheng-dual.img
+            out/rootfs-popos-26.04-cosmic-sheng-linux.img.zst
+            out/SHA256SUMS
+            out/SHA256SUMS.download
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload local APT repository and build reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: sheng-popos-26.04-arm64-build
+          path: |
+            apt-local/
+            out/packages.tsv
+            out/iso-packages.tsv
+            out/sources.tsv
+            out/device-sources.tsv
+            out/kernelrelease.txt
+            out/kernel/config-*
+            out/dpkg-audit.txt
+            out/cosmic-library-check.txt
+            out/*.log
+            out/local-apt-policy.txt
+          if-no-files-found: error
+          retention-days: 14

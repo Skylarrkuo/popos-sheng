@@ -3,3 +3,9 @@
 /work/
 /apt-local/
 *.partial
+*.iso
+*.img
+*.img.zst
+*.ext4
+*.deb
+__pycache__/
