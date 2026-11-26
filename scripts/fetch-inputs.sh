@@ -45,7 +45,10 @@ while IFS=$'\t' read -r name digest revision source; do
             fetch "${SHENG_POP_ISO_URL:-$source}" "$repo/inputs/$name" "$digest"
         fi
     else
-        [[ $revision =~ ^[[:xdigit:]]{40}$ ]]
+        if [[ ! $revision =~ ^[[:xdigit:]]{40}$ ]]; then
+            printf 'Invalid pinned Git commit for %s: %s\n' "$name" "$revision" >&2
+            exit 1
+        fi
         [[ $source =~ ^https://github[.]com/([a-zA-Z0-9._-]+)/([a-zA-Z0-9._-]+)(/|$) ]]
         fetch "https://codeload.github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/tar.gz/$revision" \
             "$repo/inputs/$name" "$digest"
