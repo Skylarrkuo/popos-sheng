@@ -54,7 +54,7 @@ df -h "$root"
 sync -f "$root"
 umount "$root"
 umount "$iso_mount"
-rm -f -- "$work/device-configured"
+rm -f -- "$work/device-configured" "$work/device-configured-v2"
 mv "$image.partial" "$image"
 touch "$work/iso-ready"
 echo 'Official Pop!_OS COSMIC root filesystem prepared'

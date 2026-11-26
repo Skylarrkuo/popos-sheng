@@ -24,6 +24,9 @@ boot=boot-popos-sheng-dual.img
 test -s "$image"
 test -f "$work/iso-ready"
 test -s "$work/device-debs.txt"
+settings_debs=("$pool"/cosmic-settings_*+sheng1_arm64.deb)
+[[ ${#settings_debs[@]} == 1 && -f ${settings_debs[0]} ]]
+settings_version=$(dpkg-deb -f "${settings_debs[0]}" Version)
 exec 9>"$work/rootfs.lock"
 flock -n 9
 exec > >(tee -a "$output/image-build.log") 2>&1
@@ -84,8 +87,8 @@ cp -L /etc/resolv.conf "$root/etc/resolv.conf"
 printf '#!/bin/sh\nexit 101\n' > "$root/usr/sbin/policy-rc.d"
 chmod 0755 "$root/usr/sbin/policy-rc.d"
 
-if [[ ! -f $work/device-configured ]]; then
-    echo '[Image 1/4] Install the firmware, hardware services, and status utilities on Pop!_OS'
+if [[ ! -f $work/device-configured-v2 ]]; then
+    echo '[Image 1/4] Install the Sheng drivers, COSMIC Settings, and TuneD power backend'
     sed -i -e 's|^URIs: http://ports.ubuntu.com/|URIs: https://ports.ubuntu.com/|' \
         -e 's|^URIs: http://apt.pop-os.org/|URIs: https://apt.pop-os.org/|' "$root/etc/apt/sources.list.d/"*.sources
     apt_options=(-o Acquire::Retries=1 -o Acquire::https::Timeout=20)
@@ -105,16 +108,24 @@ if [[ ! -f $work/device-configured ]]; then
         install -m 0644 "$pool/$name" "$root$stage/$name"
         requested+=("$stage/$name")
     done < "$work/device-debs.txt"
-    inside apt-get "${apt_options[@]}" --no-remove --no-install-recommends -y install \
-        "${requested[@]}" upower v4l-utils libcamera-tools
-    for deb in "${requested[@]}"; do rm -- "$root$deb"; done
-    rmdir "$root$stage"
+    settings=$stage/$(basename "${settings_debs[0]}")
+    install -m 0644 "${settings_debs[0]}" "$root$settings"
+    requested+=("$settings")
 
     # The Android boot image is maintained separately from the Ubuntu kernel hooks.
     install -d -m 0755 "$root/etc/flash-kernel"
     printf 'none\n' > "$root/etc/flash-kernel/machine"
     inside apt-get "${apt_options[@]}" --no-install-recommends -y install \
-        power-profiles-daemon system76-power-
+        "${requested[@]}" upower v4l-utils libcamera-tools tuned-ppd \
+        system76-power- power-profiles-daemon-
+    for deb in "${requested[@]}"; do rm -- "$root$deb"; done
+    rmdir "$root$stage"
+    # Keep the patched build selected until a newer Sheng package is available.
+    inside apt-mark hold cosmic-settings
+    install -m 0644 "$root/usr/share/popos-sheng/ppd.conf" "$root/etc/tuned/ppd.conf"
+    printf 'sheng-balanced\n' > "$root/etc/tuned/active_profile"
+    printf 'manual\n' > "$root/etc/tuned/profile_mode"
+    printf 'balanced\n' > "$root/etc/tuned/ppd_base_profile"
 
     echo '[Image 2/4] Set up the COSMIC greeter and the existing dual-boot linux partition'
     inside id "$username" >/dev/null 2>&1 || inside useradd -m -s /bin/bash -G sudo "$username"
@@ -137,9 +148,10 @@ if [[ ! -f $work/device-configured ]]; then
     test -f "$root/usr/share/wayland-sessions/cosmic.desktop"
     ln -sfn /lib/systemd/system/cosmic-greeter.service "$root/etc/systemd/system/display-manager.service"
     systemctl --root="$root" set-default graphical.target
-    systemctl --root="$root" enable NetworkManager.service bluetooth.service adsprpcd-sensorspd.service sheng-devauth.service
+    systemctl --root="$root" enable NetworkManager.service bluetooth.service \
+        adsprpcd-sensorspd.service sheng-devauth.service tuned.service tuned-ppd.service
     systemctl --root="$root" mask casper-md5check.service
-    touch "$work/device-configured"
+    touch "$work/device-configured-v2"
 fi
 
 if [[ $mode == full ]]; then
@@ -167,14 +179,29 @@ if [[ $mode == full ]]; then
     test -L "$root/usr/share/alsa/ucm2/conf.d/sm8550/Xiaomi-Pad6SPro.conf"
     grep -Fxq snd_soc_wcd938x "$root/usr/lib/modules-load.d/popos-sheng-audio.conf"
     test -s "$root/usr/lib/firmware/qcom/sm8550/sheng/devauth.mbn"
+    test -x "$root/usr/libexec/popos-sheng-mipps-pd"
+    grep -Fxq 'ExecCondition=/usr/libexec/popos-sheng-mipps-pd' \
+        "$root/usr/lib/systemd/system/xiaomi-mipps-auth.service.d/sheng-pd.conf"
+    test -x "$root/usr/libexec/popos-sheng-cpu-profile"
+    test -x "$root/usr/lib/systemd/system-sleep/sheng-cpu-resume"
+    for profile in power-saver balanced performance; do
+        test -x "$root/usr/lib/tuned/profiles/sheng-$profile/profile.sh"
+        grep -Fxq "$profile=sheng-$profile" "$root/etc/tuned/ppd.conf"
+    done
+    grep -Fxq sheng-balanced "$root/etc/tuned/active_profile"
+    for service in tuned.service tuned-ppd.service; do
+        systemctl --root "$root" is-enabled --quiet "$service"
+    done
     grep -Fxq none "$root/etc/flash-kernel/machine"
     grep -Fxq 'PARTLABEL=linux / ext4 defaults,x-systemd.growfs 0 1' "$root/etc/fstab"
     test "$(readlink "$root/etc/systemd/system/display-manager.service")" = /lib/systemd/system/cosmic-greeter.service
     inside /lib/ld-linux-aarch64.so.1 --list /usr/bin/cosmic-comp > "$output/cosmic-library-check.txt"
+    inside /lib/ld-linux-aarch64.so.1 --list /usr/bin/cosmic-settings >> "$output/cosmic-library-check.txt"
+    [[ $(inside dpkg-query -W -f='${Version}' cosmic-settings) == "$settings_version" ]]
     inside dpkg --audit | tee "$output/dpkg-audit.txt"
     test ! -s "$output/dpkg-audit.txt"
     inside apt-get check
-    packages=(cosmic-session cosmic-comp cosmic-greeter mesa-vulkan-drivers pop-desktop upower power-profiles-daemon \
+    packages=(cosmic-session cosmic-comp cosmic-greeter cosmic-settings mesa-vulkan-drivers pop-desktop upower tuned tuned-ppd \
         v4l-utils libcamera-tools libspa-0.2-libcamera)
     while IFS= read -r name; do
         packages+=("$(dpkg-deb -f "$pool/$name" Package)")

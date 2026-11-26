@@ -7,10 +7,6 @@ on:
         description: Optional HTTPS mirror for the pinned System76 ARM64 ISO
         type: string
         required: false
-      upload_images:
-        description: Upload the boot image and compressed rootfs as an artifact
-        type: boolean
-        default: true
       qemu_smoke_test:
         description: Boot the Pop!_OS rootfs on a generic ARM64 QEMU machine
         type: boolean
@@ -24,13 +20,45 @@ defaults:
     shell: bash
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 180
+  cosmic-settings:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+
+      - name: Compile the patched COSMIC Settings package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential debhelper devscripts just \
+            libdav1d-dev libinput-dev libudev-dev libwayland-dev libxkbcommon-dev pkg-config
+          rustup toolchain install 1.95.0 --profile minimal
+          bash scripts/fetch-inputs.sh --cosmic-only
+          SHENG_POP_COSMIC_WORK="$RUNNER_TEMP" bash scripts/build-cosmic-settings.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cosmic-settings-sheng-arm64
+          path: apt-local/pool/cosmic-settings_*+sheng1_arm64.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: cosmic-settings
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cosmic-settings-sheng-arm64
+          path: apt-local/pool
 
       - name: Install build tools
         env:
@@ -81,26 +109,17 @@ jobs:
             "$RUNNER_TEMP/sheng-Image" "$(cat out/kernelrelease.txt)" --timeout 300 \
             | tee out/qemu-smoke.log
 
-      - name: Upload flash images
-        if: inputs.upload_images
-        uses: actions/upload-artifact@v7
-        with:
-          name: sheng-popos-26.04-arm64-images
-          path: |
-            out/boot-popos-sheng-dual.img
-            out/rootfs-popos-26.04-cosmic-sheng-linux.img.zst
-            out/SHA256SUMS
-            out/SHA256SUMS.download
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+      - name: Prepare and verify Release assets
+        run: |
+          sudo rm -- "$SHENG_POP_WORK/rootfs.ext4"
+          bash scripts/prepare-release.sh
 
-      - name: Upload local APT repository and build reports
+      - name: Upload build reports
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: sheng-popos-26.04-arm64-build
           path: |
-            apt-local/
             out/packages.tsv
             out/iso-packages.tsv
             out/sources.tsv
@@ -111,5 +130,22 @@ jobs:
             out/cosmic-library-check.txt
             out/*.log
             out/local-apt-policy.txt
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
+
+      - name: Publish the flash images and signed APT repository to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="popos-26.04-sheng-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "Pop!_OS 26.04 for Sheng · Build $GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT" \
+            --notes "Xiaomi Pad 6S Pro (sheng), ARM64 COSMIC. Verify SHA256SUMS.download, join any numbered parts in order, decompress the .zst archives, and verify SHA256SUMS before flashing. See README.md at this tag for commands."
+          for asset in out/release/*; do
+            for attempt in 1 2 3; do
+              if gh release upload "$tag" "$asset" --clobber; then break; fi
+              if [[ $attempt == 3 ]]; then exit 1; fi
+              sleep 5
+            done
+          done
+          gh release edit "$tag" --draft=false

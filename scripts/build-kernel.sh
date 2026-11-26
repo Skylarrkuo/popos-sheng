@@ -40,9 +40,12 @@ if [[ ! -s $obj/.config ]]; then
     "$src/scripts/config" --file "$obj/.config" --disable LOCALVERSION_AUTO \
         --enable DEBUG_INFO_NONE --disable DEBUG_INFO_BTF --disable DEBUG_INFO_BTF_MODULES
 fi
-make_args=(-C "$src" O="$obj" ARCH=arm64 LLVM=1 LOCALVERSION=-poposheng1)
+# system76-scheduler listens to the kernel's process connector.
+"$src/scripts/config" --file "$obj/.config" --enable CONNECTOR --enable PROC_EVENTS
+make_args=(-C "$src" O="$obj" ARCH=arm64 LLVM=1 LOCALVERSION=-poposheng2)
 make "${make_args[@]}" olddefconfig
-for option in EFI_PARTITION EXT4_FS SCSI_UFSHCD SCSI_UFS_QCOM PHY_QCOM_QMP_UFS; do
+for option in EFI_PARTITION EXT4_FS SCSI_UFSHCD SCSI_UFS_QCOM PHY_QCOM_QMP_UFS \
+    CPU_FREQ_DEFAULT_GOV_SCHEDUTIL CONNECTOR PROC_EVENTS; do
     grep -Fx "CONFIG_$option=y" "$obj/.config"
 done
 
@@ -51,7 +54,7 @@ make "${make_args[@]}" -j"${SHENG_POP_JOBS:-8}" Image.gz qcom/sm8550-xiaomi-shen
 kver=$(make -s "${make_args[@]}" kernelrelease)
 image=$obj/arch/arm64/boot/Image.gz
 dtb=$obj/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb
-[[ $kver == 7.2.6* && $kver == *-poposheng1 ]]
+[[ $kver == 7.2.6* && $kver == *-poposheng2 ]]
 gzip -t "$image"
 fdtget -t s "$dtb" / compatible | grep -F 'xiaomi,sheng'
 

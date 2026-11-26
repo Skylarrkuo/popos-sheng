@@ -72,6 +72,26 @@ install -Dm0755 "$repo/scripts/overlays/popos-sheng-mipps-pd" \
 install -Dm0644 "$repo/scripts/overlays/mipps-pd.conf" \
     "$stage/platform/usr/lib/systemd/system/xiaomi-mipps-auth.service.d/sheng-pd.conf"
 
+install -Dm0755 "$repo/scripts/overlays/popos-sheng-cpu-profile" \
+    "$stage/platform/usr/libexec/popos-sheng-cpu-profile"
+install -Dm0755 "$repo/scripts/overlays/sheng-cpu-resume" \
+    "$stage/platform/usr/lib/systemd/system-sleep/sheng-cpu-resume"
+install -Dm0644 "$repo/scripts/overlays/sheng-tuned-ppd.conf" \
+    "$stage/platform/usr/share/popos-sheng/ppd.conf"
+for profile in power-saver balanced performance; do
+    profile_dir=$stage/platform/usr/lib/tuned/profiles/sheng-$profile
+    install -d -m 0755 "$profile_dir"
+    cat > "$profile_dir/tuned.conf" <<'EOF'
+[script]
+script=${i:PROFILE_DIR}/profile.sh
+EOF
+    cat > "$profile_dir/profile.sh" <<EOF
+#!/bin/sh
+exec /usr/libexec/popos-sheng-cpu-profile sheng-$profile "\$@"
+EOF
+    chmod 0755 "$profile_dir/profile.sh"
+done
+
 cat > "$stage/firmware/DEBIAN/control" <<'EOF'
 Package: firmware-popos-sheng
 Version: 1.0+053da477+poposheng1
@@ -96,14 +116,14 @@ Description: ALSA UCM profiles for the Xiaomi Pad 6S Pro audio card
 EOF
 cat > "$stage/platform/DEBIAN/control" <<'EOF'
 Package: popos-sheng-platform
-Version: 1.0
+Version: 1.1
 Architecture: all
 Maintainer: Pop!_OS Sheng local build <local@sheng.invalid>
-Depends: xiaomi-mipps-auth
+Depends: xiaomi-mipps-auth, tuned-ppd, python3
 Section: admin
 Priority: optional
 Description: Xiaomi Pad 6S Pro platform configuration for Pop!_OS
- Start MiPPS partner authentication once USB Power Delivery is available.
+ Integrates MiPPS partner authentication and the Sheng CPU power profiles.
 EOF
 for component in firmware audio platform; do
     dpkg-deb -Zxz -z3 --build --root-owner-group "$stage/$component" "$stage"

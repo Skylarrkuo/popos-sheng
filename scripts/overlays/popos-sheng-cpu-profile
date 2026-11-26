@@ -8,8 +8,8 @@ import time
 
 CPUFREQ = Path("/sys/devices/system/cpu/cpufreq")
 THERMAL = Path("/sys/class/thermal")
-BASELINE = Path("/etc/tuned/sheng-cpu-baseline.json")
 RUNTIME = Path("/run/popos-sheng-cpu")
+BASELINE = RUNTIME / "baseline.json"
 ACTIVE = RUNTIME / "profile"
 FIELDS = (
     "boost",
@@ -109,8 +109,17 @@ def main():
     RUNTIME.mkdir(mode=0o700, exist_ok=True)
     with (RUNTIME / "lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        baseline = json.loads(BASELINE.read_text())
         active = ACTIVE.read_text().strip() if ACTIVE.exists() else None
+        if not BASELINE.exists():
+            if active:
+                raise ValueError("Missing CPU baseline for the applied profile")
+            if len(args) < 2 or args[1] != "start" or args[0] not in PROFILES:
+                return
+            # Capture the running kernel's defaults once per boot before applying a profile.
+            staged = BASELINE.with_suffix(".new")
+            staged.write_text(json.dumps(snapshot()) + "\n")
+            staged.replace(BASELINE)
+        baseline = json.loads(BASELINE.read_text())
         previous = PROFILES[active] if active else baseline
         if args == ["resume"]:
             if active:

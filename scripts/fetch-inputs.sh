@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 mode=${1:-download}
-[[ $mode == download || $mode == --verify-only ]]
+[[ $mode == download || $mode == --verify-only || $mode == --cosmic-only ]]
 mkdir -p "$repo/inputs/debs"
 exec 9>"$repo/inputs/.downloads.lock"
 flock 9
@@ -34,6 +34,7 @@ fetch() {
 
 while IFS=$'\t' read -r name digest revision source; do
     [[ $name != input ]] || continue
+    [[ $mode != --cosmic-only || $name == cosmic-settings.tar.gz ]] || continue
     [[ $name =~ ^[a-zA-Z0-9._+-]+$ ]]
     if [[ $name == *.iso ]]; then
         if [[ -n ${SHENG_POP_ISO:-} ]]; then
@@ -50,6 +51,8 @@ while IFS=$'\t' read -r name digest revision source; do
             "$repo/inputs/$name" "$digest"
     fi
 done < "$repo/sources.tsv"
+
+if [[ $mode == --cosmic-only ]]; then exit 0; fi
 
 while IFS=$'\t' read -r asset digest url; do
     [[ $asset != asset ]] || continue
