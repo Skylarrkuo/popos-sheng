@@ -1,0 +1,6 @@
+input	sha256	revision	source
+pop-os_26.04_arm64_generic_1.iso	b0fc96d609ba62e9374a42724fae0320144961a36be6a02370b5076a337df5b8	26.04 LTS ARM Generic 1	https://system76.com/download-pop/
+ubuntu-sheng.tar.gz	ac693ada772fb1423e40cdc8af7ec64b9d5d68fe676026dad2157f2c96eb3e27	eaff0351dba8e352f3ea9da52b28c93ba6c4ddbe	https://github.com/code002-2/ubuntu-sheng
+Xiaomi-pad-6s-pro-Linux.tar.gz	22ccf19062be72added630b1d4f201e2311927f98e493f76edcc61e2ed41dd1c	48c3155e6c165706f426811773316bd1055fd5e3	https://github.com/code002-2/Xiaomi-pad-6s-pro-Linux
+sm8550-mainline.tar.gz	12f3d2ea84dcf3f568cf688aefd9c06d6436dabdf3cdb7254bef93a73b339970	42f3b40c702abbc37c3a04c95af008cd283aeaf3	https://github.com/ianchb/sm8550-mainline/tree/sheng-7.2.6
+sheng-firmware.tar.gz	89d297041dccb37cd5d3c992dd0e5e75b12cdb6c6753d4b21f789dd21eb59dbe	053da477a5c338ac28d7c1c869e8c3ff7ca24d11	https://github.com/ianchb/sheng-firmware

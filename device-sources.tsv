@@ -1,0 +1,12 @@
+asset	sha256	url
+fastrpc_1.0.2-1_arm64.deb	6a5d2082c05a378aa9226341ca7204a6f1e146cbdc5199349b7193f2ce5a25de	https://github.com/alghiffaryfa19/Linux-xiaomi-sheng/releases/download/kernel-bundle-7.2.2/fastrpc_1.0.2-1_arm64.deb
+libssc_0.4.2-1_arm64.deb	8e97be9775fe0326b4d090a60c088d9d22e84941b4c61865f1a662339de0263d	https://github.com/alghiffaryfa19/Linux-xiaomi-sheng/releases/download/kernel-bundle-7.2.2/libssc_0.4.2-1_arm64.deb
+iio-sensor-proxy_99993.8-6_arm64.deb	53962ba99845e5c1f1b8de08363a86019a133d19d8f3f523c7926b47e2a46733	https://github.com/alghiffaryfa19/Linux-xiaomi-sheng/releases/download/kernel-bundle-7.2.2/iio-sensor-proxy_99993.8-6_arm64.deb
+sheng-sensors_20240917-1_arm64.deb	f53ea2ec3ffd18e9285a992ddd373be3a47363346e1533f01ed6f7d5c79f3d20	https://github.com/alghiffaryfa19/Linux-xiaomi-sheng/releases/download/kernel-bundle-7.2.2/sheng-sensors_20240917-1_arm64.deb
+sheng-devauth.deb	d0e2a533e8545913e91c1befbd09eb476d238645d3ef27a3e5feddd84adf5e4d	https://github.com/alghiffaryfa19/Linux-xiaomi-sheng/releases/download/kernel-bundle-7.2.2/sheng-devauth.deb
+xiaomi-mipps-auth_0.21_arm64.deb	0ae28ca1f157f8c1bd82ff551ee037d6ca30f73bb899d89f76b320ffbf591736	https://github.com/ianchb/xiaomi-mipps-auth/releases/download/0.21/xiaomi-mipps-auth_0.21_arm64.deb
+xiaomi-charger-mode_0.20_arm64.deb	a4223d36828196c80c38b6c492fdd9f17d028dfff81dd39739d5af6ac0e1ad43	https://github.com/ianchb/xiaomi-charger-mode/releases/download/0.20/xiaomi-charger-mode_0.20_arm64.deb
+xiaomi-sheng-thp_0.3.9_arm64.deb	94abb9436fcaf848553a7c556c582ba039ec8152da0f83618377e9b41f37060c	https://github.com/ianchb/xiaomi-sheng-thp/releases/download/v0.3.9/xiaomi-sheng-thp_0.3.9_arm64.deb
+xiaomi-pen-status_0.2.3_arm64.deb	1d3d47b6009279470fd18918ed25391f103ce22e956bf54f4f7668a4bace9841	https://github.com/ianchb/xiaomi-pen-status/releases/download/v0.2.3/xiaomi-pen-status_0.2.3_arm64.deb
+xiaomi-sheng-fingerprint_0.1.4_arm64.deb	d2c8ac871b902b64385fbb5c2c1171a9f6172c8949cafb43e66fe9f2b4b52bd8	https://github.com/ianchb/xiaomi-sheng-fingerprint/releases/download/v0.1.4/xiaomi-sheng-fingerprint_0.1.4_arm64.deb
+xiaomi-sheng-keyboard-helper_0.2.0_arm64.deb	ab8aee6c568f1521db944032ab6063442210bbb516effa89be0fda18546641b6	https://github.com/ianchb/xiaomi-sheng-keyboard-helper/releases/download/v0.2.0/xiaomi-sheng-keyboard-helper_0.2.0_arm64.deb
