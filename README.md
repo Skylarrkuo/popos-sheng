@@ -12,7 +12,7 @@
 ## 在 GitHub Actions 构建
 
 1. 打开 [Build Pop!_OS for Sheng](https://github.com/Skylarrkuo/popos-sheng/actions/workflows/build.yml)，或在自己的 Fork 中进入同名工作流。
-2. 点击 **Run workflow**，选择分支和需要的选项。工作流会校验固定来源的 SHA‑256，编译 COSMIC Settings 和 Sheng 内核，再生成刷机镜像。
+2. 点击 **Run workflow**，选择分支和需要的选项。工作流会校验固定来源的 SHA‑256，并行编译 COSMIC Settings 和 Sheng 内核，再生成刷机镜像。镜像作业失败后可用 **Re-run failed jobs** 复用已经成功编出的内核与设置包。
 3. 构建成功后到 [Releases](https://github.com/Skylarrkuo/popos-sheng/releases) 下载启动镜像、压缩根镜像、签名 APT 仓库和校验清单。每次运行生成独立的 Release。运行详情的 `sheng-popos-26.04-arm64-build` Artifact 提供构建报告。
 
 | 输入 | 默认值 | 用途 |

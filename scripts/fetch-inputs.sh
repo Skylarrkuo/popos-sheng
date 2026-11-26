@@ -3,7 +3,10 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 mode=${1:-download}
-[[ $mode == download || $mode == --verify-only || $mode == --cosmic-only ]]
+case $mode in
+    download|--verify-only|--cosmic-only|--kernel-only|--image-only) ;;
+    *) exit 2 ;;
+esac
 mkdir -p "$repo/inputs/debs"
 exec 9>"$repo/inputs/.downloads.lock"
 flock 9
@@ -34,7 +37,11 @@ fetch() {
 
 while IFS=$'\t' read -r name digest revision source; do
     [[ $name != input ]] || continue
-    [[ $mode != --cosmic-only || $name == cosmic-settings.tar.gz ]] || continue
+    case $mode in
+        --cosmic-only) [[ $name == cosmic-settings.tar.gz ]] || continue ;;
+        --kernel-only) [[ $name == ubuntu-sheng.tar.gz || $name == sm8550-mainline.tar.gz ]] || continue ;;
+        --image-only) [[ $name != cosmic-settings.tar.gz && $name != sm8550-mainline.tar.gz ]] || continue ;;
+    esac
     [[ $name =~ ^[a-zA-Z0-9._+-]+$ ]]
     if [[ $name == *.iso ]]; then
         if [[ -n ${SHENG_POP_ISO:-} ]]; then
@@ -55,7 +62,7 @@ while IFS=$'\t' read -r name digest revision source; do
     fi
 done < "$repo/sources.tsv"
 
-if [[ $mode == --cosmic-only ]]; then exit 0; fi
+if [[ $mode == --cosmic-only || $mode == --kernel-only ]]; then exit 0; fi
 
 while IFS=$'\t' read -r asset digest url; do
     [[ $asset != asset ]] || continue

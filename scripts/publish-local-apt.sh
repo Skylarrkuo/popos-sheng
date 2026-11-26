@@ -38,11 +38,13 @@ mv popos-sheng-archive.gpg.partial popos-sheng-archive.gpg
 gpgv --keyring "$PWD/popos-sheng-archive.gpg" InRelease
 gpg --batch --with-colons --fingerprint "$identity" | awk -F: '$1 == "fpr" {print $10}' > SIGNING-KEY-FINGERPRINT.txt
 
-check=$(mktemp -d "${TMPDIR:-/tmp}/popos-sheng-apt-check.XXXXXXXX")
+check=$(mktemp -d /tmp/popos-sheng-apt-check.XXXXXXXX)
 trap 'rm -r -- "$check"' EXIT
 chmod 0755 "$check"
-mkdir "$check/lists"
-printf 'deb [arch=arm64 signed-by=%s/popos-sheng-archive.gpg] file:%s ./\n' "$apt_repo" "$apt_repo" > "$check/source.list"
+mkdir "$check/lists" "$check/repo"
+# APT's verifier runs as _apt and cannot traverse a private runner home.
+install -m 0644 InRelease Packages Packages.gz popos-sheng-archive.gpg "$check/repo/"
+printf 'deb [arch=arm64 signed-by=%s/repo/popos-sheng-archive.gpg] file:%s/repo ./\n' "$check" "$check" > "$check/source.list"
 cat > "$check/apt.conf" <<EOF
 APT::Architecture "arm64";
 Dir::Etc::SourceList "$check/source.list";

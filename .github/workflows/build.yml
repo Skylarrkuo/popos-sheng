@@ -42,10 +42,43 @@ jobs:
           name: cosmic-settings-sheng-arm64
           path: apt-local/pool/cosmic-settings_*+sheng1_arm64.deb
           if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  kernel:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Compile and package the Sheng kernel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bc bison build-essential clang cpio \
+            curl device-tree-compiler dpkg-dev file flex kmod libelf-dev libssl-dev lld \
+            llvm lz4 python3 rsync xz-utils zstd
+          bash scripts/fetch-inputs.sh --kernel-only
+          sudo env SHENG_POP_WORK="$RUNNER_TEMP/popos-sheng-kernel" SHENG_POP_JOBS="$(nproc)" \
+            bash scripts/build-kernel.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sheng-kernel-arm64
+          path: |
+            apt-local/pool/linux-image-popos-sheng_*_arm64.deb
+            out/boot-popos-sheng-dual.img
+            out/kernel/
+            out/kernel-build.log
+            out/kernelrelease.txt
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
           retention-days: 7
 
   build:
-    needs: cosmic-settings
+    needs: [cosmic-settings, kernel]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     permissions:
@@ -60,14 +93,18 @@ jobs:
           name: cosmic-settings-sheng-arm64
           path: apt-local/pool
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: sheng-kernel-arm64
+          path: .
+
       - name: Install build tools
         env:
           QEMU_SMOKE_TEST: ${{ inputs.qemu_smoke_test }}
         run: |
           sudo apt-get update
-          packages=(bc bison build-essential clang cpio curl device-tree-compiler
-            dpkg-dev e2fsprogs file flex gnupg kmod libelf-dev libssl-dev lld
-            llvm lz4 python3 rsync squashfs-tools xz-utils zstd android-sdk-libsparse-utils)
+          packages=(curl dpkg-dev e2fsprogs file gnupg python3 squashfs-tools xz-utils
+            zstd android-sdk-libsparse-utils)
           if [[ $QEMU_SMOKE_TEST == true ]]; then packages+=(qemu-system-arm); fi
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           sudo apt-get clean
@@ -77,15 +114,7 @@ jobs:
       - name: Download and verify pinned sources
         env:
           SHENG_POP_ISO_URL: ${{ inputs.iso_url }}
-        run: bash scripts/fetch-inputs.sh
-
-      - name: Compile and package the Sheng kernel
-        run: |
-          sudo env SHENG_POP_WORK="$SHENG_POP_WORK" SHENG_POP_JOBS="$(nproc)" \
-            bash scripts/build-kernel.sh
-          test "$SHENG_POP_WORK" = "$RUNNER_TEMP/popos-sheng"
-          sudo rm -r -- "$SHENG_POP_WORK/kernel-src" "$SHENG_POP_WORK/kernel-build"
-          df -h "$SHENG_POP_WORK"
+        run: bash scripts/fetch-inputs.sh --image-only
 
       - name: Extract the Pop!_OS ARM64 system and build device packages
         run: |
@@ -93,6 +122,10 @@ jobs:
             bash scripts/prepare-rootfs.sh
           rm -- inputs/pop-os_26.04_arm64_generic_1.iso
           sudo env SHENG_POP_WORK="$SHENG_POP_WORK" bash scripts/build-device-packages.sh
+          read -r release < out/kernelrelease.txt
+          kernel_deb="linux-image-popos-sheng_${release}_arm64.deb"
+          test -s "apt-local/pool/$kernel_deb"
+          printf '%s\n' "$kernel_deb" | sudo tee "$SHENG_POP_WORK/kernel-deb.txt" >/dev/null
 
       - name: Build and verify the compressed flash image
         run: |
@@ -131,6 +164,7 @@ jobs:
             out/*.log
             out/local-apt-policy.txt
           if-no-files-found: warn
+          overwrite: true
           retention-days: 14
 
       - name: Publish the flash images and signed APT repository to GitHub Releases
