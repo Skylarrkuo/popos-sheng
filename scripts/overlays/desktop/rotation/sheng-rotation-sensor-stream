@@ -1,0 +1,44 @@
+#!/usr/bin/python3
+import os
+from pathlib import Path
+import selectors
+import socket
+import subprocess
+
+
+def main():
+    compatible = Path("/sys/firmware/devicetree/base/compatible")
+    if not compatible.is_file() or b"xiaomi,sheng" not in compatible.read_bytes().split(b"\0"):
+        return
+    with socket.socket(fileno=os.dup(0)) as client, selectors.DefaultSelector() as events:
+        client.settimeout(1)
+        with subprocess.Popen(
+            ["/usr/bin/stdbuf", "-oL", "/usr/bin/ssccli", "--sensor=accelerometer", "--timeout=600"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+        ) as sensor:
+            events.register(client, selectors.EVENT_READ)
+            events.register(sensor.stdout, selectors.EVENT_READ)
+            try:
+                while True:
+                    ready = events.select()
+                    if any(key.fileobj is client for key, _ in ready):
+                        # The connection is output-only. Readability means close or unsolicited input.
+                        return
+                    data = os.read(sensor.stdout.fileno(), 8192)
+                    if not data:
+                        return
+                    try:
+                        client.sendall(data)
+                    except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                        return
+            finally:
+                sensor.terminate()
+                try:
+                    sensor.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    sensor.kill()
+
+
+if __name__ == "__main__":
+    main()

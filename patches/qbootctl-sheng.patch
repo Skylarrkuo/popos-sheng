@@ -1,0 +1,2280 @@
+diff --git a/bootctrl.h b/bootctrl.h
+index fcbd807..3ad7e8f 100644
+--- a/bootctrl.h
++++ b/bootctrl.h
+@@ -110,9 +110,10 @@ struct boot_control_module {
+ 	* setActiveBootSlot() has been called, the getter function should return
+ 	* the same slot as the one provided in the last setActiveBootSlot() call.
+ 	*/
+-	unsigned (*getActiveBootSlot)();
++	int (*getActiveBootSlot)(void);
+ };
+ 
+ extern const struct boot_control_module bootctl;
++int dry_run_set_active_boot_slot(unsigned slot);
+ 
+ #endif // __BOOTCTRL_H__
+diff --git a/bootctrl_impl.c b/bootctrl_impl.c
+index 5586f72..cfc5fb2 100644
+--- a/bootctrl_impl.c
++++ b/bootctrl_impl.c
+@@ -48,6 +48,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <signal.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -62,25 +63,6 @@
+ 
+ #include "bootctrl.h"
+ 
+-#define BOOTDEV_DIR	  "/dev/disk/by-partlabel"
+-#define BOOT_IMG_PTN_NAME "boot_"
+-#define LUN_NAME_END_LOC  14
+-#define BOOT_SLOT_PROP	  "slot_suffix"
+-
+-#define MAX_CMDLINE_SIZE  4096
+-
+-#define SLOT_ACTIVE	  1
+-#define SLOT_INACTIVE	  2
+-#define UPDATE_SLOT(pentry, guid, slot_state)                                                      \
+-	({                                                                                         \
+-		memcpy(pentry, guid, TYPE_GUID_SIZE);                                              \
+-		if (slot_state == SLOT_ACTIVE)                                                     \
+-			*(pentry + AB_FLAG_OFFSET) = AB_SLOT_ACTIVE_VAL;                           \
+-		else if (slot_state == SLOT_INACTIVE)                                              \
+-			*(pentry + AB_FLAG_OFFSET) =                                               \
+-				(*(pentry + AB_FLAG_OFFSET) & ~AB_PARTITION_ATTR_SLOT_ACTIVE);     \
+-	})
+-
+ const char *slot_suffix_arr[] = { AB_SLOT_A_SUFFIX, AB_SLOT_B_SUFFIX, NULL };
+ 
+ enum part_attr_type {
+@@ -90,34 +72,30 @@ enum part_attr_type {
+ 	ATTR_BOOTABLE,
+ };
+ 
+-void get_kernel_cmdline_arg(const char *arg, char *buf, const char *def)
++static int read_current_slot(void)
+ {
+-	int fd;
+-	char pcmd[MAX_CMDLINE_SIZE];
+-	char *val, *found, *ptr = buf;
+-	fd = open("/proc/cmdline", O_RDONLY);
+-	int rc = read(fd, pcmd, MAX_CMDLINE_SIZE);
+-	if (rc < 0) {
+-		fprintf(stderr, "Couldn't open /proc/cmdline: %d (%s)\n", rc, strerror(errno));
+-		goto error;
+-	}
+-	close(fd);
+-	found = strstr(pcmd, arg);
+-	if (!found || !(val = strstr(found, "="))) {
+-		fprintf(stderr, "Couldn't find cmdline arg: '%s'\n", arg);
+-		goto error;
+-	}
++	char *line = NULL;
++	char *token, *ctx;
++	size_t capacity = 0;
++	int slot = -1;
++	FILE *f = fopen("/proc/cmdline", "r");
+ 
+-	val++;
+-	// no this doesn't handle quotes lol
+-	while (*val != ' ') {
+-		*ptr++ = *val++;
++	if (!f)
++		return -1;
++	if (getline(&line, &capacity, f) >= 0) {
++		for (token = strtok_r(line, " \t\r\n", &ctx); token;
++		     token = strtok_r(NULL, " \t\r\n", &ctx)) {
++			if (!strcmp(token, "androidboot.slot_suffix=_a") ||
++			    !strcmp(token, "slot_suffix=_a"))
++				slot = 0;
++			if (!strcmp(token, "androidboot.slot_suffix=_b") ||
++			    !strcmp(token, "slot_suffix=_b"))
++				slot = 1;
++		}
+ 	}
+-
+-	return;
+-
+-error:
+-	strcpy(buf, def);
++	free(line);
++	fclose(f);
++	return slot;
+ }
+ 
+ // Get the value of one of the attribute fields for a partition.
+@@ -206,7 +184,10 @@ static int update_slot_attribute(struct gpt_disk *disk, unsigned slot,
+ 
+ 		// If the current partition is for a different disk (e.g. /dev/sde when the current disk is /dev/sda)
+ 		// Then commit the current disk
+-		if (!partition_is_for_disk(disk, partName, devpath, sizeof(devpath))) {
++		rc = partition_is_for_disk(disk, partName, devpath, sizeof(devpath));
++		if (rc < 0)
++			return rc;
++		if (rc == 0 && gpt_disk_is_valid(disk)) {
+ 			if (gpt_disk_commit(disk)) {
+ 				fprintf(stderr, "%s: Failed to commit disk\n", __func__);
+ 				return -1;
+@@ -262,57 +243,17 @@ static int update_slot_attribute(struct gpt_disk *disk, unsigned slot,
+ 	return 0;
+ }
+ 
+-/*
+- * Returns 0 for no slots, or the number of slots found.
+- * Fun semantic note: Having "1" slot (ie just a "boot" partition)
+- * is the same as having "no slots".
+- *
+- * This function will never return 1.
+- */
+-unsigned get_number_slots()
++unsigned get_number_slots(void)
+ {
+-	struct dirent *de = NULL;
+-	DIR *dir_bootdev = NULL;
+-	static int slot_count = 0;
+-
+-	// If we've already counted the slots, return the cached value.
+-	// If there are no slots then we'll always rerun the search...
+-	if (slot_count > 0)
+-		return slot_count;
+-
+-	assert(AB_SLOT_A_SUFFIX[0] == '_');
+-	assert(AB_SLOT_B_SUFFIX[0] == '_');
+-
+-	dir_bootdev = opendir(BOOTDEV_DIR);
+-	// Shouldn't this be an assert?
+-	if (!dir_bootdev) {
+-		fprintf(stderr, "%s: Failed to open bootdev dir (%s)\n", __func__, strerror(errno));
+-		return 0;
+-	}
+-
+-	while ((de = readdir(dir_bootdev))) {
+-		if (de->d_name[0] == '.')
+-			continue;
+-		if (!strncmp(de->d_name, BOOT_IMG_PTN_NAME, strlen(BOOT_IMG_PTN_NAME)) &&
+-		    !!strncmp(de->d_name, "boot_aging\n", strlen("boot_aging"))) {
+-			slot_count++;
+-		}
+-	}
+-
+-	if (slot_count < 0)
+-		slot_count = 0;
+-
+-	closedir(dir_bootdev);
+-
+-	return slot_count;
++	struct stat st;
++	return !stat(BOOT_DEV_DIR "/boot_a", &st) && !stat(BOOT_DEV_DIR "/boot_b", &st) ? 2 : 0;
+ }
+ 
+ static int boot_control_check_slot_sanity(unsigned slot)
+ {
+-	uint32_t num_slots = get_number_slots();
+-	if ((num_slots < 1) || (slot > num_slots - 1)) {
+-		fprintf(stderr, "Invalid slot number %u\n", slot);
+-		return -1;
++	if (slot >= 2 || get_number_slots() != 2) {
++		fprintf(stderr, "Invalid slot number %u or missing A/B boot partitions\n", slot);
++		return -EINVAL;
+ 	}
+ 	return 0;
+ }
+@@ -331,65 +272,25 @@ int get_boot_attr(struct gpt_disk *disk, unsigned slot, enum part_attr_type attr
+ 	return get_partition_attribute(disk, bootPartition, attr);
+ }
+ 
+-unsigned get_active_boot_slot()
++int get_active_boot_slot(void)
+ {
+ 	struct gpt_disk disk = { 0 };
+-	uint32_t num_slots = get_number_slots();
+-
+-	if (num_slots <= 1) {
+-		// Slot 0 is the only slot around.
+-		return 0;
+-	}
++	int a = get_boot_attr(&disk, 0, ATTR_SLOT_ACTIVE);
++	int b = get_boot_attr(&disk, 1, ATTR_SLOT_ACTIVE);
+ 
+-	for (uint32_t i = 0; i < num_slots; i++) {
+-		if (get_boot_attr(&disk, i, ATTR_SLOT_ACTIVE)) {
+-			gpt_disk_free(&disk);
+-			return i;
+-		}
+-	}
+-
+-	fprintf(stderr, "%s: Failed to find the active boot slot\n", __func__);
+ 	gpt_disk_free(&disk);
+-	return 0;
++	if (a < 0 || b < 0 || a == b) {
++		fprintf(stderr, "Cannot identify a unique active boot slot\n");
++		return -1;
++	}
++	return b ? 1 : 0;
+ }
+ 
+-/*
+- * The current slot is usually made available via the kernel cmdline. If it isn't for some reason
+- * (e.g. because we booted via a secondary bootloader that removes Android cmdline args) then we
+- * assume that the active slot is the current slot
+- */
+-static int get_current_or_active_slot()
++static int get_current_or_active_slot(void)
+ {
+-	uint32_t num_slots = 0;
+-	char bootSlotProp[MAX_CMDLINE_SIZE] = { '\0' };
+-	unsigned i = 0;
+-	num_slots = get_number_slots();
+-	if (num_slots == 0)
+-		return -ENOENT;
+-	if (num_slots == 1) {
+-		// Slot 0 is the only slot around.
+-		return 0;
+-	}
++	int slot = read_current_slot();
+ 
+-	get_kernel_cmdline_arg(BOOT_SLOT_PROP, bootSlotProp, "N/A");
+-	if (!strncmp(bootSlotProp, "N/A\n", strlen("N/A"))) {
+-		fprintf(stderr, "%s: Unable to read boot slot property\n", __func__);
+-		return get_active_boot_slot();
+-	}
+-
+-	// Iterate through a list of partitons named as boot+suffix
+-	// and see which one is currently active.
+-	for (i = 0; slot_suffix_arr[i] != NULL; i++) {
+-		if (!strncmp(bootSlotProp, slot_suffix_arr[i], strlen(slot_suffix_arr[i]))) {
+-			// printf("%s current_slot = %d\n", __func__, i);
+-			return i;
+-		}
+-	}
+-
+-	// The HAL spec requires that we return a number between
+-	// 0 to num_slots - 1. Since something went wrong here we
+-	// are just going to return the default slot.
+-	return 0;
++	return slot >= 0 ? slot : get_active_boot_slot();
+ }
+ 
+ int is_slot_bootable(unsigned slot)
+@@ -398,10 +299,8 @@ int is_slot_bootable(unsigned slot)
+ 	struct gpt_disk disk = { 0 };
+ 
+ 	attr = get_boot_attr(&disk, slot, ATTR_UNBOOTABLE);
+-	if (attr >= 0)
+-		return !attr;
+-
+-	return -1;
++	gpt_disk_free(&disk);
++	return attr < 0 ? -1 : !attr;
+ }
+ 
+ int mark_boot_successful(unsigned slot)
+@@ -449,174 +348,448 @@ const char *get_suffix(unsigned slot)
+ }
+ 
+ 
+-// The argument here is a vector of partition names(including the slot suffix)
+-// that lie on a single disk
+-static int boot_ctl_set_active_slot_for_partitions(struct gpt_disk *disk,
+-						   unsigned slot)
+-{
+-	char buf[GPT_PTN_PATH_MAX] = { 0 };
+-	const char *slotA;
+-	char slotB[MAX_GPT_NAME_SIZE] = { 0 };
+-	char active_guid[TYPE_GUID_SIZE + 1] = { 0 };
+-	char inactive_guid[TYPE_GUID_SIZE + 1] = { 0 };
+-	int rc, i;
+-	// Pointer to the partition entry of current 'A' partition
+-	uint8_t *pentryA = NULL;
+-	uint8_t *pentryA_bak = NULL;
+-	// Pointer to partition entry of current 'B' partition
+-	uint8_t *pentryB = NULL;
+-	uint8_t *pentryB_bak = NULL;
+-	struct stat st;
+-
+-	LOGD("Marking slot %s as active:\n", slot_suffix_arr[slot]);
++struct disk_change {
++	struct gpt_disk before;
++	struct gpt_disk after;
++};
+ 
+-	for (i = 0, slotA = g_all_ptns[0]; i < ARRAY_SIZE(g_all_ptns); slotA = g_all_ptns[++i]) {
+-		// Chop off the slot suffix from the partition name to
+-		// make the string easier to work with.
+-		LOGD("Part: %s\n", slotA);
+-		int n = strlen(slotA) - strlen(AB_SLOT_A_SUFFIX);
+-		if (n + 1 < 3 || n + 1 > MAX_GPT_NAME_SIZE) {
+-			fprintf(stderr, "Invalid partition name: %s\n", slotA);
+-			return -1;
+-		}
++static bool is_sheng(void)
++{
++	char compatible[1024];
++	FILE *f = fopen("/sys/firmware/devicetree/base/compatible", "rb");
++	size_t bytes;
++
++	if (!f)
++		return false;
++	bytes = fread(compatible, 1, sizeof(compatible), f);
++	fclose(f);
++	for (size_t i = 0; i < bytes;) {
++		size_t len = strnlen(compatible + i, bytes - i);
++
++		if (len == sizeof("xiaomi,sheng") - 1 &&
++		    !memcmp(compatible + i, "xiaomi,sheng", len))
++			return true;
++		i += len + 1;
++	}
++	return false;
++}
+ 
+-		memset(slotB, 0, sizeof(slotB));
+-		strncat(slotB, slotA, MAX_GPT_NAME_SIZE - 1);
+-		slotB[strlen(slotB) - 1] = 'b';
++static struct disk_change *disk_for_pair(struct disk_change *changes,
++					 size_t *count, const char *a, const char *b)
++{
++	char path[PATH_MAX];
++	struct disk_change *change;
+ 
+-		rc = snprintf(buf, sizeof(buf) - 1, "%s", BOOT_DEV_DIR);
+-		snprintf(buf + rc, GPT_PTN_PATH_MAX - rc, "/%s", slotA);
+-		LOGD("Checking for partition %s\n", buf);
+-		if (stat(buf, &st)) {
+-			if (!strcmp(slotA, "boot_a") || !strcmp(slotA, "dtbo_a")) {
+-				fprintf(stderr, "Couldn't find required partition %s\n", slotA);
+-				return -1;
+-			}
+-			// Not every device has every partition
+-			continue;
++	for (size_t i = 0; i < *count; i++) {
++		if (partition_is_for_disk(&changes[i].before, a, path, sizeof(path)) == 1) {
++			change = &changes[i];
++			goto check_peer;
+ 		}
++	}
++	change = &changes[*count];
++	if (gpt_disk_get_disk_info(a, &change->before))
++		return NULL;
++	(*count)++;
++	if (gpt_disk_copy(&change->after, &change->before))
++		return NULL;
++
++check_peer:
++	if (partition_is_for_disk(&change->before, b, path, sizeof(path)) != 1) {
++		fprintf(stderr, "%s and %s do not belong to the same GPT\n", a, b);
++		return NULL;
++	}
++	return change;
++}
+ 
+-		buf[strlen(buf) - 1] = 'b';
+-		if (stat(buf, &st)) {
+-			fprintf(stderr, "Partition %s does not exist\n", buf);
+-			return -1;
+-		}
++static int stage_entry_pair(uint8_t *entries[2], unsigned current, unsigned target)
++{
++	uint8_t *active = entries[current];
++	uint8_t *inactive = entries[1 - current];
++	uint8_t guid[TYPE_GUID_SIZE];
++
++	if (!(active[AB_FLAG_OFFSET] & AB_PARTITION_ATTR_SLOT_ACTIVE) ||
++	    (inactive[AB_FLAG_OFFSET] & AB_PARTITION_ATTR_SLOT_ACTIVE))
++		return -EINVAL;
++	if (target == current)
++		return 0;
++	memcpy(guid, active, sizeof(guid));
++	memcpy(active, inactive, sizeof(guid));
++	memcpy(inactive, guid, sizeof(guid));
++	active[AB_FLAG_OFFSET] &= ~AB_PARTITION_ATTR_SLOT_ACTIVE;
++	inactive[AB_FLAG_OFFSET] = AB_SLOT_ACTIVE_VAL;
++	return 0;
++}
+ 
+-		// Get the disk containing this partition. This only
+-		// actually re-initialises disk if this partition refers
+-		// to a different block device than the last one.
+-		if (gpt_disk_get_disk_info(slotA, disk) < 0)
+-			return -1;
++static int stage_pair(struct disk_change *changes, size_t *count, const char *name,
++		      unsigned current, unsigned target)
++{
++	struct stat st;
++	char a_path[GPT_PTN_PATH_MAX], b_path[GPT_PTN_PATH_MAX];
++	char b[MAX_GPT_NAME_SIZE + 1];
++	struct disk_change *disk;
++	bool a_present, b_present;
++	uint8_t *entries[2][2];
++
++	strcpy(b, name);
++	b[strlen(b) - 1] = 'b';
++	snprintf(a_path, sizeof(a_path), "%s/%s", BOOT_DEV_DIR, name);
++	snprintf(b_path, sizeof(b_path), "%s/%s", BOOT_DEV_DIR, b);
++	a_present = stat(a_path, &st) == 0;
++	if (!a_present && errno != ENOENT)
++		return -1;
++	b_present = stat(b_path, &st) == 0;
++	if (!b_present && errno != ENOENT)
++		return -1;
++	if (!a_present && !b_present && strcmp(name, "boot_a") && strcmp(name, "dtbo_a"))
++		return 0;
++	if (!a_present || !b_present) {
++		fprintf(stderr, "Missing required partition pair %s / %s\n", name, b);
++		return -1;
++	}
+ 
+-		// Get partition entry for slot A & B from the primary
+-		// and backup tables.
+-		pentryA = gpt_disk_get_pentry(disk, slotA, PRIMARY_GPT);
+-		pentryA_bak = gpt_disk_get_pentry(disk, slotA, SECONDARY_GPT);
+-		pentryB = gpt_disk_get_pentry(disk, slotB, PRIMARY_GPT);
+-		pentryB_bak = gpt_disk_get_pentry(disk, slotB, SECONDARY_GPT);
+-		if (!pentryA || !pentryA_bak || !pentryB || !pentryB_bak) {
+-			// None of these should be NULL since we have already
+-			// checked for A & B versions earlier.
+-			fprintf(stderr, "Slot pentries for %s not found.\n", slotA);
+-			return -1;
+-		}
+-		LOGD("\tAB attr (A): 0x%x (backup: 0x%x)\n", *(uint16_t *)(pentryA + AB_FLAG_OFFSET),
+-		     *(uint16_t *)(pentryA_bak + AB_FLAG_OFFSET));
+-		LOGD("\tAB attr (B): 0x%x (backup: 0x%x)\n", *(uint16_t *)(pentryB + AB_FLAG_OFFSET),
+-		     *(uint16_t *)(pentryB_bak + AB_FLAG_OFFSET));
+-		memset(active_guid, '\0', sizeof(active_guid));
+-		memset(inactive_guid, '\0', sizeof(inactive_guid));
+-		if (get_partition_attribute(disk, slotA, ATTR_SLOT_ACTIVE) == 1) {
+-			// A is the current active slot
+-			memcpy((void *)active_guid, (const void *)pentryA, TYPE_GUID_SIZE);
+-			memcpy((void *)inactive_guid, (const void *)pentryB, TYPE_GUID_SIZE);
+-		} else if (get_partition_attribute(disk, slotB, ATTR_SLOT_ACTIVE) == 1) {
+-			// B is the current active slot
+-			memcpy((void *)active_guid, (const void *)pentryB, TYPE_GUID_SIZE);
+-			memcpy((void *)inactive_guid, (const void *)pentryA, TYPE_GUID_SIZE);
+-		} else {
+-			fprintf(stderr, "Both A & B are inactive..Aborting");
++	disk = disk_for_pair(changes, count, name, b);
++	if (!disk)
++		return -1;
++	for (int copy = PRIMARY_GPT; copy <= SECONDARY_GPT; copy++) {
++		entries[copy][0] = gpt_disk_get_pentry(&disk->after, name, copy);
++		entries[copy][1] = gpt_disk_get_pentry(&disk->after, b, copy);
++		if (!entries[copy][0] || !entries[copy][1]) {
++			fprintf(stderr, "Partition pair missing from GPT: %s / %s\n", name, b);
+ 			return -1;
+ 		}
+-		int a_state = slot == 0 ? SLOT_ACTIVE : SLOT_INACTIVE;
+-		int b_state = slot == 1 ? SLOT_ACTIVE : SLOT_INACTIVE;
++	}
+ 
+-		// This check *Really* shouldn't be here... But I don't know this codebase
+-		// well enough to remove it.
+-		if (slot > 1) {
+-			fprintf(stderr, "%s: Unknown slot %d!\n", __func__, slot);
+-			return -1;
++	for (int copy = PRIMARY_GPT; copy <= SECONDARY_GPT; copy++) {
++		if (stage_entry_pair(entries[copy], current, target)) {
++			fprintf(stderr, "Unexpected active flags for %s / %s\n", name, b);
++			return -EINVAL;
+ 		}
+-
+-		// Mark A as active in primary table
+-		UPDATE_SLOT(pentryA, active_guid, a_state);
+-		// Mark A as active in backup table
+-		UPDATE_SLOT(pentryA_bak, active_guid, a_state);
+-		// Mark B as inactive in primary table
+-		UPDATE_SLOT(pentryB, inactive_guid, b_state);
+-		// Mark B as inactive in backup table
+-		UPDATE_SLOT(pentryB_bak, inactive_guid, b_state);
+ 	}
++	return 0;
++}
+ 
+-	// write updated content to disk
+-	if (gpt_disk_commit(disk)) {
+-		fprintf(stderr, "Failed to commit disk entry");
++static int verify_lun(uint8_t expected)
++{
++	uint8_t actual;
++
++	if (read_boot_lun(&actual))
+ 		return -1;
++	if (actual == expected)
++		return 0;
++	fprintf(stderr, "Expected UFS boot LUN %u, found %u\n", expected, actual);
++	return -1;
++}
++
++static int commit_switch(struct disk_change *changes, size_t count,
++			 uint8_t old_lun, uint8_t new_lun)
++{
++	size_t attempted = 0;
++	bool lun_attempted = false;
++	bool restored = true;
++	int rc = -EIO;
++	sigset_t blocked, original;
++
++	/* Let a normal termination complete the commit or rollback first. */
++	sigemptyset(&blocked);
++	sigaddset(&blocked, SIGINT);
++	sigaddset(&blocked, SIGTERM);
++	sigaddset(&blocked, SIGHUP);
++	sigaddset(&blocked, SIGQUIT);
++	if (sigprocmask(SIG_BLOCK, &blocked, &original))
++		return -errno;
++
++	for (size_t i = 0; i < count; i++)
++		if (gpt_disk_verify(&changes[i].before))
++			goto out;
++	if (old_lun && verify_lun(old_lun))
++		goto out;
++
++	while (attempted < count) {
++		struct gpt_disk *next = &changes[attempted++].after;
++
++		if (gpt_disk_commit(next))
++			goto rollback;
++	}
++	if (old_lun) {
++		lun_attempted = true;
++		if (set_boot_lun(new_lun) || verify_lun(new_lun))
++			goto rollback;
+ 	}
++	rc = 0;
++	goto out;
++
++rollback:
++	fprintf(stderr, "Slot switch failed. Restoring the original boot metadata.\n");
++	if (lun_attempted && verify_lun(old_lun)) {
++		/* A rejected command can still have changed the device. Verify the result. */
++		set_boot_lun(old_lun);
++		if (verify_lun(old_lun))
++			restored = false;
++	}
++	while (attempted)
++		if (gpt_disk_commit(&changes[--attempted].before))
++			restored = false;
++	if (restored)
++		fprintf(stderr, "Original boot metadata restored and verified.\n");
++	else
++		fprintf(stderr, "Rollback could not be verified. Do not reboot; recover with Fastboot.\n");
+ 
+-	return 0;
++out:
++	sigprocmask(SIG_SETMASK, &original, NULL);
++	return rc;
+ }
+ 
+-int set_active_boot_slot(unsigned slot, bool ignore_missing_bsg)
++#ifdef QBOOTCTL_SHENG_PROFILE
++#include <spawn.h>
++#include <sys/wait.h>
++
++struct sheng_guid_pair {
++	size_t a, b;
++};
++
++struct sheng_reference {
++	const char *probe;
++	uint32_t block_size, entry_size, table_size;
++	const char *primary_header, *backup_header;
++	const char *entries[2];
++	const char *alternate_b_entries;
++	const struct sheng_guid_pair *alternate_b_guid_pairs;
++	size_t alternate_b_guid_pair_count;
++};
++
++#include QBOOTCTL_SHENG_PROFILE
++
++#define SHENG_BOOT_MANIFEST "/etc/qbootctl-sheng/boot.sha256"
++#define BOOT_RETRY_BITS 0x38
++
++static int verify_sheng_boot_images(void)
+ {
+-	enum boot_chain chain = (enum boot_chain)slot;
+-	struct gpt_disk disk = { 0 };
+-	int rc;
+-	bool ismmc;
++	char *const argv[] = {"/usr/bin/sha256sum", "--check", "--strict", "--quiet",
++			     SHENG_BOOT_MANIFEST, NULL};
++	char *const env[] = {"LC_ALL=C", NULL};
++	struct stat st;
++	pid_t child, waited;
++	int status;
++
++	if (lstat(SHENG_BOOT_MANIFEST, &st) || !S_ISREG(st.st_mode) || st.st_uid ||
++	    (st.st_mode & (S_IWGRP | S_IWOTH)) ||
++	    posix_spawn(&child, argv[0], NULL, NULL, argv, env))
++		goto reject;
++	do {
++		waited = waitpid(child, &status, 0);
++	} while (waited < 0 && errno == EINTR);
++	if (waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0)
++		return 0;
++reject:
++	fprintf(stderr, "Sheng boot image manifest failed verification. No changes made.\n");
++	return -EINVAL;
++}
+ 
+-	if (boot_control_check_slot_sanity(slot)) {
+-		fprintf(stderr, "%s: Bad arguments\n", __func__);
+-		return -1;
++static bool same_header_layout(const uint8_t *actual, const char *reference, size_t bytes)
++{
++	return !memcmp(actual, reference, HEADER_CRC_OFFSET) &&
++	       !memcmp(actual + HEADER_CRC_OFFSET + 4, reference + HEADER_CRC_OFFSET + 4,
++		       PARTITION_CRC_OFFSET - HEADER_CRC_OFFSET - 4) &&
++	       !memcmp(actual + PARTITION_CRC_OFFSET + 4, reference + PARTITION_CRC_OFFSET + 4,
++		       bytes - PARTITION_CRC_OFFSET - 4);
++}
++
++static bool matches_sheng_guid_pair(const uint8_t *actual, const struct sheng_reference *ref,
++				   size_t offset)
++{
++	for (size_t i = 0; i < ref->alternate_b_guid_pair_count; i++) {
++		const struct sheng_guid_pair *pair = &ref->alternate_b_guid_pairs[i];
++
++		if (offset == pair->a || offset == pair->b)
++			return !memcmp(actual + pair->a, ref->alternate_b_entries + pair->a, TYPE_GUID_SIZE) &&
++			       !memcmp(actual + pair->b, ref->alternate_b_entries + pair->b, TYPE_GUID_SIZE);
+ 	}
++	return false;
++}
+ 
+-	ismmc = gpt_utils_is_partition_backed_by_emmc(PTN_XBL AB_SLOT_A_SUFFIX);
++static bool matches_sheng_disk(struct gpt_disk *disk, const struct sheng_reference *ref,
++			       unsigned current)
++{
++	const uint8_t *expected = (const uint8_t *)ref->entries[current];
++	const uint8_t *alternate = current == 1 ? (const uint8_t *)ref->alternate_b_entries : NULL;
++	size_t boot_entries[2] = { SIZE_MAX, SIZE_MAX };
++
++	if (disk->block_size != ref->block_size || disk->pentry_size != ref->entry_size ||
++	    disk->pentry_arr_size != ref->table_size ||
++	    !same_header_layout(disk->hdr, ref->primary_header, ref->block_size) ||
++	    !same_header_layout(disk->hdr_bak, ref->backup_header, ref->block_size))
++		return false;
++
++	if (!strcmp(ref->probe, "boot_a")) {
++		for (size_t i = 0; i < 2; i++) {
++			uint8_t *p = gpt_disk_get_pentry(disk, i ? "boot_b" : "boot_a", PRIMARY_GPT);
++
++			if (!p)
++				return false;
++			boot_entries[i] = p - disk->pentry_arr;
++		}
++	}
+ 
+-	// Do this *before* updating all the slot attributes
+-	// to make sure we can
+-	if (!ismmc && !ignore_missing_bsg && ufs_bsg_dev_open() < 0) {
+-		return -1;
++	for (size_t offset = 0; offset < ref->table_size; offset += ref->entry_size) {
++		const uint8_t *actual = disk->pentry_arr + offset;
++		const uint8_t *entry = expected + offset;
++		size_t flag = offset + AB_FLAG_OFFSET;
++		uint8_t flag_mask = UINT8_MAX;
++
++		if (memcmp(actual + TYPE_GUID_SIZE, entry + TYPE_GUID_SIZE, AB_FLAG_OFFSET - TYPE_GUID_SIZE) ||
++		    memcmp(actual + AB_FLAG_OFFSET + 1, entry + AB_FLAG_OFFSET + 1,
++			   ref->entry_size - AB_FLAG_OFFSET - 1))
++			return false;
++
++		if (memcmp(actual, entry, TYPE_GUID_SIZE) &&
++		    (!alternate || !matches_sheng_guid_pair(disk->pentry_arr, ref, offset)))
++			return false;
++
++		/* The bootloader can decrement retries on either boot entry. */
++		if (offset == boot_entries[0] || offset == boot_entries[1])
++			flag_mask &= ~BOOT_RETRY_BITS;
++		if (((actual[AB_FLAG_OFFSET] ^ expected[flag]) & flag_mask) &&
++		    (!alternate || ((actual[AB_FLAG_OFFSET] ^ alternate[flag]) & flag_mask)))
++			return false;
+ 	}
++	return true;
++}
+ 
+-	rc = boot_ctl_set_active_slot_for_partitions(&disk, slot);
++static int switch_sheng_slot(unsigned slot, bool dry_run)
++{
++	struct disk_change changes[ARRAY_SIZE(sheng_profile)] = { 0 };
++	size_t count = 0;
++	int current, rc = -EIO;
++
++	if (slot > 1 || verify_sheng_boot_images())
++		return -EINVAL;
++	current = get_active_boot_slot();
++	if (current < 0)
++		return current;
++	if (verify_lun(current + 1))
++		return -EIO;
++
++	for (size_t i = 0; i < ARRAY_SIZE(sheng_profile); i++) {
++		const struct sheng_reference *ref = &sheng_profile[i];
++		struct disk_change *change = &changes[count];
++
++		if (gpt_disk_get_disk_info(ref->probe, &change->before))
++			goto out;
++		if (!matches_sheng_disk(&change->before, ref, current)) {
++			fprintf(stderr, "Sheng GPT for %s does not match slot %c calibration. "
++				"No changes made.\n", ref->probe, 'A' + current);
++			goto out;
++		}
++		if (current == (int)slot ||
++		    !memcmp(change->before.pentry_arr, ref->entries[slot], ref->table_size)) {
++			gpt_disk_free(&change->before);
++			continue;
++		}
++		count++;
++		if (gpt_disk_copy(&change->after, &change->before))
++			goto out;
++		memcpy(change->after.pentry_arr, ref->entries[slot], ref->table_size);
++		memcpy(change->after.pentry_arr_bak, ref->entries[slot], ref->table_size);
++	}
+ 
+-	if (rc) {
+-		fprintf(stderr, "%s: Failed to set active slot for partitions \n", __func__);
+-		goto out;
++	if (dry_run) {
++		printf("Sheng dry run: slot %c -> %c, %zu of %zu GPTs change; "
++		       "UFS boot LUN %u -> %u. Boot images verified.\n",
++		       'A' + current, 'A' + slot, count, ARRAY_SIZE(sheng_profile),
++		       current + 1, slot + 1);
++		for (size_t i = 0; i < count; i++)
++			printf("  %s\n", changes[i].before.devpath);
++		rc = 0;
++	} else if (current == (int)slot) {
++		rc = 0;
++	} else if (count) {
++		rc = commit_switch(changes, count, current + 1, slot + 1);
++	}
++out:
++	for (size_t i = 0; i < ARRAY_SIZE(changes); i++) {
++		gpt_disk_free(&changes[i].after);
++		gpt_disk_free(&changes[i].before);
+ 	}
++	return rc;
++}
++#endif
+ 
+-	// EMMC doesn't need attributes to be set.
+-	if (ismmc)
+-		goto out;
++static int switch_slot(unsigned slot, bool dry_run)
++{
++	struct disk_change *changes;
++	size_t count = 0;
++	int current;
++	int rc = -EIO;
++	uint8_t lun = 0;
++	struct stat st;
+ 
+-	if (chain > BACKUP_BOOT) {
+-		fprintf(stderr, "%s: Unknown slot %d!\n", __func__, slot);
+-		rc = -1;
+-		goto out;
++	if (is_sheng()) {
++#ifdef QBOOTCTL_SHENG_PROFILE
++		return switch_sheng_slot(slot, dry_run);
++#else
++		fprintf(stderr, "Xiaomi sheng requires a verified device-specific A/B layout; "
++			"the generic partition list is incomplete. No changes made.\n");
++		return -ENOTSUP;
++#endif
++	}
++	if (boot_control_check_slot_sanity(slot))
++		return -EINVAL;
++	current = get_active_boot_slot();
++	if (current < 0)
++		return current;
++
++	if (!gpt_utils_is_partition_backed_by_emmc("boot_a")) {
++		if (stat(BOOT_DEV_DIR "/xbl_a", &st) || stat(BOOT_DEV_DIR "/xbl_b", &st)) {
++			fprintf(stderr, "Missing XBL boot pair\n");
++			return -ENODEV;
++		}
++		lun = current + 1;
++		if (verify_lun(lun))
++			return -EIO;
+ 	}
+ 
+-	rc = gpt_utils_set_xbl_boot_partition(chain);
+-	if (rc) {
+-		if (ignore_missing_bsg && rc == -ENODEV)
+-			rc = 0;
+-		else
+-			fprintf(stderr, "%s: Failed to switch xbl boot partition\n", __func__);
++	changes = calloc(ARRAY_SIZE(g_all_ptns), sizeof(*changes));
++	if (!changes)
++		return -ENOMEM;
++	for (size_t i = 0; i < ARRAY_SIZE(g_all_ptns); i++)
++		if (stage_pair(changes, &count, g_all_ptns[i], current, slot))
++			goto out;
++
++	if (dry_run) {
++		printf("Dry run: %s -> %s; %zu GPT disk(s)\n",
++		       slot_suffix_arr[current], slot_suffix_arr[slot], count);
++		if (lun)
++			printf("UFS boot LUN: %u -> %u\n", lun, slot + 1);
++		rc = 0;
++	} else if (current == (int)slot) {
++		rc = 0;
++	} else {
++		rc = commit_switch(changes, count, lun, slot + 1);
+ 	}
+ 
+ out:
+-	gpt_disk_free(&disk);
++	for (size_t i = 0; i < count; i++) {
++		gpt_disk_free(&changes[i].after);
++		gpt_disk_free(&changes[i].before);
++	}
++	free(changes);
+ 	return rc;
+ }
+ 
++int set_active_boot_slot(unsigned slot, bool ignore_missing_bsg)
++{
++	if (ignore_missing_bsg) {
++		fprintf(stderr, "An unverified UFS boot LUN cannot be ignored.\n");
++		return -EINVAL;
++	}
++	return switch_slot(slot, false);
++}
++
++int dry_run_set_active_boot_slot(unsigned slot)
++{
++	return switch_slot(slot, true);
++}
++
+ int set_slot_as_unbootable(unsigned slot)
+ {
+ 	struct gpt_disk disk = { 0 };
+diff --git a/gpt-utils.c b/gpt-utils.c
+index fe678a3..64520f5 100644
+--- a/gpt-utils.c
++++ b/gpt-utils.c
+@@ -86,11 +86,13 @@
+ 	 ((uint64_t) * ((uint8_t *)(ptr) + 5) << 40) |                                             \
+ 	 ((uint64_t) * ((uint8_t *)(ptr) + 6) << 48) | ((uint64_t) * ((uint8_t *)(ptr) + 7) << 56))
+ 
+-#define PUT_4_BYTES(ptr, y)                                                                        \
+-	*((uint8_t *)(ptr)) = (y)&0xff;                                                            \
+-	*((uint8_t *)(ptr) + 1) = ((y) >> 8) & 0xff;                                               \
+-	*((uint8_t *)(ptr) + 2) = ((y) >> 16) & 0xff;                                              \
+-	*((uint8_t *)(ptr) + 3) = ((y) >> 24) & 0xff;
++static void put_le32(uint8_t *p, uint32_t value)
++{
++	p[0] = value;
++	p[1] = value >> 8;
++	p[2] = value >> 16;
++	p[3] = value >> 24;
++}
+ 
+ enum gpt_state { GPT_OK = 0, GPT_BAD_SIGNATURE, GPT_BAD_CRC };
+ // List of LUN's containing boot critical images.
+@@ -147,33 +149,24 @@ void DumpHex(const void *data, size_t size)
+  */
+ static int blk_rw(int fd, int rw, uint64_t offset, uint8_t *buf, unsigned len)
+ {
+-	int r;
+-
+-	if (lseek64(fd, offset, SEEK_SET) < 0) {
+-		fprintf(stderr, "block dev lseek64 %" PRIu64 " failed: %s\n", offset,
+-			strerror(errno));
+-		return -1;
+-	}
+-
+-	if (rw)
+-		r = write(fd, buf, len);
+-	else
+-		r = read(fd, buf, len);
+-
+-	if (r < 0) {
+-		fprintf(stderr, "block dev %s failed: %s\n", rw ? "write" : "read\n",
+-			strerror(errno));
+-	} else {
+-		if (rw) {
+-			r = fsync(fd);
+-			if (r < 0)
+-				fprintf(stderr, "fsync failed: %s\n", strerror(errno));
+-		} else {
+-			r = 0;
++	unsigned done = 0;
++
++	while (done < len) {
++		ssize_t n = rw ?
++			pwrite64(fd, buf + done, len - done, offset + done) :
++			pread64(fd, buf + done, len - done, offset + done);
++
++		if (n < 0 && errno == EINTR)
++			continue;
++		if (n <= 0) {
++			fprintf(stderr, "Block %s at %" PRIu64 ": %s\n",
++				rw ? "write" : "read", offset + done,
++				n == 0 ? "short I/O" : strerror(errno));
++			return -1;
+ 		}
++		done += n;
+ 	}
+-
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -191,99 +184,31 @@ static int blk_rw(int fd, int rw, uint64_t offset, uint8_t *buf, unsigned len)
+  *
+  *  ==========================================================================
+  */
+-static uint8_t *gpt_pentry_seek(const char *ptn_name, const uint8_t *pentries_start,
+-				const uint8_t *pentries_end, uint32_t pentry_size)
++static uint8_t *gpt_pentry_seek(const char *name, uint8_t *start,
++			      const uint8_t *end, uint32_t entry_size)
+ {
+-	char *pentry_name;
+-	unsigned len = strlen(ptn_name);
+-
+-	for (pentry_name = (char *)(pentries_start + PARTITION_NAME_OFFSET);
+-	     pentry_name < (char *)pentries_end; pentry_name += pentry_size) {
+-		char name8[MAX_GPT_NAME_SIZE / 2];
+-		unsigned i;
+-
+-		/* Partition names in GPT are UTF-16 - ignoring UTF-16 2nd byte */
+-		for (i = 0; i < sizeof(name8); i++)
+-			name8[i] = pentry_name[i * 2];
+-		if (!strncmp(ptn_name, name8, len))
+-			if (name8[len] == 0 || !strcmp(&name8[len], BAK_PTN_NAME_EXT))
+-				return (uint8_t *)(pentry_name - PARTITION_NAME_OFFSET);
+-	}
+-
+-	return NULL;
+-}
+-
+-// Defined in ufs-bsg.cpp
+-int32_t set_boot_lun(uint8_t lun_id);
++	const size_t capacity = MAX_GPT_NAME_SIZE / 2;
++	size_t len = strlen(name);
++	uint8_t *match = NULL;
+ 
+-// Switch between using either the primary or the backup
+-// boot LUN for boot. This is required since UFS boot partitions
+-// cannot have a backup GPT which is what we use for failsafe
+-// updates of the other 'critical' partitions. This function will
+-// not be invoked for emmc targets and on UFS targets is only required
+-// to be invoked for XBL.
+-//
+-// The algorithm to do this is as follows:
+-//- Find the real block device(eg: /dev/disk/sdb) that corresponds
+-//  to the /dev/disk/bootdevice/by-name/xbl(bak) symlink
+-//
+-//- Once we have the block device 'node' name(sdb in the above example)
+-//  use this node to to locate the scsi generic device that represents
+-//  it by checking the file /sys/block/sdb/device/scsi_generic/sgY
+-//
+-//- Once we locate sgY we call the query ioctl on /dev/sgy to switch
+-// the boot lun to either LUNA or LUNB
+-int gpt_utils_set_xbl_boot_partition(enum boot_chain chain)
+-{
+-	struct stat st;
+-	uint8_t boot_lun_id = 0;
+-	const char *boot_dev = NULL;
+-	int ret = -1;
+-
+-	(void)st;
+-	(void)boot_dev;
+-
+-	if (chain == BACKUP_BOOT) {
+-		boot_lun_id = BOOT_LUN_B_ID;
+-		if (!stat(XBL_BACKUP, &st))
+-			boot_dev = XBL_BACKUP;
+-		else if (!stat(XBL_AB_SECONDARY, &st))
+-			boot_dev = XBL_AB_SECONDARY;
+-		else {
+-			fprintf(stderr, "%s: Failed to locate secondary xbl\n", __func__);
+-			goto error;
+-		}
+-	} else if (chain == NORMAL_BOOT) {
+-		boot_lun_id = BOOT_LUN_A_ID;
+-		if (!stat(XBL_PRIMARY, &st))
+-			boot_dev = XBL_PRIMARY;
+-		else if (!stat(XBL_AB_PRIMARY, &st))
+-			boot_dev = XBL_AB_PRIMARY;
+-		else {
+-			fprintf(stderr, "%s: Failed to locate primary xbl\n", __func__);
+-			goto error;
+-		}
+-	} else {
+-		fprintf(stderr, "%s: Invalid boot chain id\n", __func__);
+-		goto error;
+-	}
+-	// We need either both xbl and xblbak or both xbl_a and xbl_b to exist at
+-	// the same time. If not the current configuration is invalid.
+-	if ((stat(XBL_PRIMARY, &st) || stat(XBL_BACKUP, &st)) &&
+-	    (stat(XBL_AB_PRIMARY, &st) || stat(XBL_AB_SECONDARY, &st))) {
+-		fprintf(stderr, "%s:primary/secondary XBL prt not found(%s)\n", __func__,
+-			strerror(errno));
+-		goto error;
+-	}
+-	LOGD("%s: setting %s lun as boot lun\n", __func__, boot_dev);
+-
+-	if (set_boot_lun(boot_lun_id)) {
+-		ret = -ENODEV;
+-		goto error;
++	if (len > capacity)
++		return NULL;
++	for (; start < end; start += entry_size) {
++		const uint8_t *utf16 = start + PARTITION_NAME_OFFSET;
++		size_t i;
++
++		if (!GET_8_BYTES(start + FIRST_LBA_OFFSET))
++			continue;
++		for (i = 0; i < len; i++)
++			if (utf16[i * 2] != (uint8_t)name[i] || utf16[i * 2 + 1])
++				break;
++		if (i != len || (len < capacity && (utf16[len * 2] || utf16[len * 2 + 1])))
++			continue;
++		if (match)
++			return NULL;
++		match = start;
+ 	}
+-	return 0;
+-error:
+-	return ret;
++	return match;
+ }
+ 
+ // Given a parttion name(eg: rpm) get the path to the block device that
+@@ -293,32 +218,27 @@ error:
+ // the path to the LUN from there.
+ static int get_dev_path_from_partition_name(const char *partname, char *buf, size_t buflen)
+ {
+-	char path[GPT_PTN_PATH_MAX] = { 0 };
+-	int i;
++	char path[GPT_PTN_PATH_MAX];
++	char resolved[PATH_MAX];
++	struct stat st;
++	size_t len;
++	int n = snprintf(path, sizeof(path), "%s/%s", BOOT_DEV_DIR, partname);
+ 
+-	if (!partname || !buf || buflen < ((PATH_TRUNCATE_LOC) + 1)) {
+-		fprintf(stderr, "%s: Invalid argument\n", __func__);
++	if (n < 0 || (size_t)n >= sizeof(path) || !realpath(path, resolved) ||
++	    stat(resolved, &st) || !S_ISBLK(st.st_mode))
+ 		return -1;
+-	}
+-
+-	// Need to find the lun that holds partition partname
+-	snprintf(path, sizeof(path), "%s/%s", BOOT_DEV_DIR, partname);
+ 
+-
+-	buf = realpath(path, buf);
+-	if (!buf) {
++	len = strlen(resolved);
++	while (len && isdigit((unsigned char)resolved[len - 1]))
++		len--;
++	if (len == strlen(resolved))
+ 		return -1;
+-	} else {
+-		for (i = strlen(buf); i > 0; i--)
+-			if (!isdigit(buf[i - 1]))
+-				break;
+-
+-		if (i >= 2 && buf[i - 1] == 'p' && isdigit(buf[i - 2]))
+-			i--;
+-
+-		buf[i] = 0;
+-	}
+-
++	if (len >= 2 && resolved[len - 1] == 'p' && isdigit((unsigned char)resolved[len - 2]))
++		len--;
++	if (len >= buflen)
++		return -1;
++	memcpy(buf, resolved, len);
++	buf[len] = '\0';
+ 	return 0;
+ }
+ 
+@@ -383,115 +303,57 @@ error:
+ 	return -1;
+ }
+ 
+-// Read out the GPT headers for the disk that contains the partition partname
+-static int gpt_get_headers(const char *partname, uint8_t **primary, uint8_t **backup)
++static int load_gpt_copy(int fd, uint32_t block, uint64_t last, bool backup,
++			 uint8_t **header_out, uint8_t **entries_out)
+ {
+-	uint8_t *hdr = NULL;
+-	char devpath[GPT_PTN_PATH_MAX] = { 0 };
+-	off_t hdr_offset = 0;
+-	uint32_t block_size = 0;
+-	int instance;
+-	int fd = -1;
+-
+-	if (!partname) {
+-		fprintf(stderr, "%s: Invalid partition name\n", __func__);
+-		goto error;
+-	}
+-
+-	if (get_dev_path_from_partition_name(partname, devpath, sizeof(devpath)) != 0) {
+-		fprintf(stderr, "%s: Failed to resolve path for %s\n", __func__, partname);
+-		goto error;
+-	}
+-
+-	fd = open(devpath, O_RDONLY);
+-	if (fd < 0) {
+-		fprintf(stderr, "%s: Failed to open %s : %s\n", __func__, devpath, strerror(errno));
+-		return -1;
+-	}
+-
+-	block_size = gpt_get_block_size(fd);
+-	if (block_size == 0) {
+-		fprintf(stderr, "%s: Failed to get gpt block size for %s\n", __func__, partname);
+-		goto error;
+-	}
+-
+-	for (instance = PRIMARY_GPT; instance <= SECONDARY_GPT; instance++) {
+-		hdr = (uint8_t *)calloc(block_size, 1);
+-		if (!hdr) {
+-			fprintf(stderr, "%s: Failed to allocate memory for gpt header\n", __func__);
+-		}
+-		if (instance == PRIMARY_GPT)
+-			hdr_offset = block_size;
+-		else {
+-			hdr_offset = lseek64(fd, 0, SEEK_END) - block_size;
+-		}
+-		if (hdr_offset < 0) {
+-			fprintf(stderr, "%s: Failed to get gpt header offset\n", __func__);
+-			goto error;
+-		}
+-		if (blk_rw(fd, 0, hdr_offset, hdr, block_size)) {
+-			fprintf(stderr, "%s: Failed to read GPT header from device\n", __func__);
+-			goto error;
+-		}
+-		if (instance == PRIMARY_GPT)
+-			*primary = hdr;
+-		else
+-			*backup = hdr;
+-	}
++	uint64_t header_lba = backup ? last : 1;
++	uint64_t first_usable, last_usable, entries_lba, entry_blocks;
++	uint32_t header_size, stored_crc, count, entry_size;
++	size_t size;
++	uint8_t *header = malloc(block);
++	uint8_t *entries = NULL;
++	int ret = -1;
+ 
+-	close(fd);
++	if (!header || blk_rw(fd, 0, header_lba * block, header, block))
++		goto out;
++	header_size = GET_4_BYTES(header + HEADER_SIZE_OFFSET);
++	if (memcmp(header, GPT_SIGNATURE, 8) || header_size < 92 || header_size > block ||
++	    GET_8_BYTES(header + PRIMARY_HEADER_OFFSET) != header_lba ||
++	    GET_8_BYTES(header + BACKUP_HEADER_OFFSET) != (backup ? 1 : last))
++		goto out;
++	stored_crc = GET_4_BYTES(header + HEADER_CRC_OFFSET);
++	put_le32(header + HEADER_CRC_OFFSET, 0);
++	if (efi_crc32(header, header_size) != stored_crc)
++		goto out;
++	put_le32(header + HEADER_CRC_OFFSET, stored_crc);
++
++	count = GET_4_BYTES(header + PARTITION_COUNT_OFFSET);
++	entry_size = GET_4_BYTES(header + PENTRY_SIZE_OFFSET);
++	if (!count || entry_size < PTN_ENTRY_SIZE || entry_size % PTN_ENTRY_SIZE ||
++	    (uint64_t)count * entry_size > 16 * 1024 * 1024)
++		goto out;
++	size = (size_t)count * entry_size;
++	first_usable = GET_8_BYTES(header + FIRST_USABLE_LBA_OFFSET);
++	last_usable = GET_8_BYTES(header + LAST_USABLE_LBA_OFFSET);
++	entries_lba = GET_8_BYTES(header + PENTRIES_OFFSET);
++	entry_blocks = (size + block - 1) / block;
++	if (first_usable < 2 || first_usable > last_usable || last_usable >= last ||
++	    entries_lba < 2 || entries_lba >= last || entry_blocks > last - entries_lba)
++		goto out;
++	if (backup ? entries_lba <= last_usable : entries_lba + entry_blocks > first_usable)
++		goto out;
++
++	entries = malloc(size);
++	if (!entries || blk_rw(fd, 0, entries_lba * block, entries, size) ||
++	    efi_crc32(entries, size) != GET_4_BYTES(header + PARTITION_CRC_OFFSET))
++		goto out;
++	*header_out = header;
++	*entries_out = entries;
+ 	return 0;
+-
+-error:
+-	close(fd);
+-	if (hdr)
+-		free(hdr);
+-	return -1;
+-}
+-
+-// Returns the partition entry array based on the
+-// passed in buffer which contains the gpt header.
+-// The fd here is the descriptor for the 'disk' which
+-// holds the partition
+-static uint8_t *gpt_get_pentry_arr(uint8_t *hdr, int fd)
+-{
+-	uint64_t pentries_start = 0;
+-	uint32_t pentry_size = 0;
+-	uint32_t block_size = 0;
+-	uint32_t pentries_arr_size = 0;
+-	uint8_t *pentry_arr = NULL;
+-	int rc = 0;
+-	if (!hdr) {
+-		fprintf(stderr, "%s: Invalid header\n", __func__);
+-		goto error;
+-	}
+-	if (fd < 0) {
+-		fprintf(stderr, "%s: Invalid fd\n", __func__);
+-		goto error;
+-	}
+-	block_size = gpt_get_block_size(fd);
+-	if (!block_size) {
+-		fprintf(stderr, "%s: Failed to get gpt block size for\n", __func__);
+-		goto error;
+-	}
+-	pentries_start = GET_8_BYTES(hdr + PENTRIES_OFFSET) * block_size;
+-	pentry_size = GET_4_BYTES(hdr + PENTRY_SIZE_OFFSET);
+-	pentries_arr_size = GET_4_BYTES(hdr + PARTITION_COUNT_OFFSET) * pentry_size;
+-	pentry_arr = (uint8_t *)calloc(1, pentries_arr_size);
+-	if (!pentry_arr) {
+-		fprintf(stderr, "%s: Failed to allocate memory for partition array\n", __func__);
+-		goto error;
+-	}
+-	rc = blk_rw(fd, 0, pentries_start, pentry_arr, pentries_arr_size);
+-	if (rc) {
+-		fprintf(stderr, "%s: Failed to read partition entry array\n", __func__);
+-		goto error;
+-	}
+-	return pentry_arr;
+-error:
+-	if (pentry_arr)
+-		free(pentry_arr);
+-	return NULL;
++out:
++	free(header);
++	free(entries);
++	return ret;
+ }
+ 
+ static int gpt_set_pentry_arr(uint8_t *hdr, int fd, uint8_t *arr)
+@@ -587,95 +449,98 @@ int partition_is_for_disk(const struct gpt_disk *disk, const char *part, char *b
+ 	return false;
+ }
+ 
+-/*
+- * fills up the passed in gpt_disk struct with information about the
+- * disk represented by path dev. Returns 0 on success and -1 on error.
+- */
+-int gpt_disk_get_disk_info(const char *dev, struct gpt_disk *disk)
++static int load_disk(const char *path, struct gpt_disk *disk)
+ {
+-	int fd = -1, rc;
+-	uint32_t gpt_header_size = 0;
+-	char devpath[GPT_PTN_PATH_MAX] = { 0 };
++	uint32_t block;
++	uint64_t bytes;
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	int rc = -1;
++
++	if (fd < 0)
++		goto out;
++	block = gpt_get_block_size(fd);
++	if (block < 512 || block > 65536 || (block & (block - 1)) ||
++	    ioctl(fd, BLKGETSIZE64, &bytes) || bytes % block || bytes / block < 6)
++		goto out;
++	if (load_gpt_copy(fd, block, bytes / block - 1, false, &disk->hdr, &disk->pentry_arr) ||
++	    load_gpt_copy(fd, block, bytes / block - 1, true, &disk->hdr_bak, &disk->pentry_arr_bak))
++		goto out;
+ 
+-	if (!disk || !dev) {
+-		fprintf(stderr, "%s: Invalid arguments\n", __func__);
+-		goto error;
+-	}
+-
+-	rc = partition_is_for_disk(disk, dev, devpath, sizeof(devpath));
+-
+-	if (rc > 0)
+-		return 0;
+-
+-	if (rc < 0) {
+-		fprintf(stderr, "%s: Failed to resolve path for %s\n", __func__, dev);
+-		return -1;
+-	}
+-
+-	if (disk->is_initialized == GPT_DISK_INIT_MAGIC) {
+-		/* Commit any changes to the disk */
+-		if (gpt_disk_commit(disk)) {
+-			fprintf(stderr, "Failed to commit disk entry");
+-			return -1;
+-		}
+-		// We already have a valid disk handle. Free it.
+-		LOGD("%s: Freeing disk handle for %s... -> %s\n", __func__, disk->devpath, devpath);
++	disk->pentry_size = GET_4_BYTES(disk->hdr + PENTRY_SIZE_OFFSET);
++	disk->pentry_arr_size = GET_4_BYTES(disk->hdr + PARTITION_COUNT_OFFSET) * disk->pentry_size;
++	if (memcmp(disk->hdr + FIRST_USABLE_LBA_OFFSET,
++		   disk->hdr_bak + FIRST_USABLE_LBA_OFFSET, 32) ||
++	    memcmp(disk->hdr + PARTITION_COUNT_OFFSET,
++		   disk->hdr_bak + PARTITION_COUNT_OFFSET, 8) ||
++	    memcmp(disk->pentry_arr, disk->pentry_arr_bak, disk->pentry_arr_size))
++		goto out;
++
++	disk->block_size = block;
++	disk->is_initialized = GPT_DISK_INIT_MAGIC;
++	if (strlen(path) >= sizeof(disk->devpath))
++		goto out;
++	strcpy(disk->devpath, path);
++	rc = 0;
++out:
++	if (fd >= 0)
++		close(fd);
++	if (rc) {
++		fprintf(stderr, "Cannot read matching, valid primary and backup GPTs on %s\n", path);
+ 		gpt_disk_free(disk);
+ 	}
++	return rc;
++}
+ 
+-	LOGD("%s: Initializing disk handle for %s... -> %s\n", __func__, disk->devpath, devpath);
+-
+-	// devpath popualted by partition_is_for_disk
+-	strncpy(disk->devpath, devpath, sizeof(disk->devpath));
+-
+-	if (gpt_get_headers(dev, &disk->hdr, &disk->hdr_bak)) {
+-		fprintf(stderr, "%s: Failed to get GPT headers\n", __func__);
+-		goto error;
+-	}
+-
+-	assert(disk->hdr != NULL);
+-	assert(disk->hdr_bak != NULL);
+-
+-	gpt_header_size = GET_4_BYTES(disk->hdr + HEADER_SIZE_OFFSET);
+-
+-	// FIXME: pointer offsets crc bleh
+-	disk->hdr_crc = efi_crc32(disk->hdr, gpt_header_size);
+-
+-	disk->hdr_bak_crc = efi_crc32(disk->hdr_bak, gpt_header_size);
++int gpt_disk_get_disk_info(const char *part, struct gpt_disk *disk)
++{
++	char devpath[PATH_MAX];
++	int rc = partition_is_for_disk(disk, part, devpath, sizeof(devpath));
+ 
+-	fd = open(disk->devpath, O_RDONLY);
+-	if (fd < 0) {
+-		fprintf(stderr, "%s: Failed to open %s: %s\n", __func__, disk->devpath,
+-			strerror(errno));
+-		goto error;
+-	}
++	if (rc < 0)
++		return rc;
++	if (rc > 0 && gpt_disk_is_valid(disk))
++		return 0;
+ 
+-	assert(disk->pentry_arr == NULL);
+-	disk->pentry_arr = gpt_get_pentry_arr(disk->hdr, fd);
+-	if (!disk->pentry_arr) {
+-		fprintf(stderr, "%s: Failed to obtain partition entry array\n", __func__);
+-		goto error;
+-	}
++	/* Loading or inspecting a disk must never write a previously loaded disk. */
++	gpt_disk_free(disk);
++	return load_disk(devpath, disk);
++}
+ 
+-	assert(disk->pentry_arr_bak == NULL);
+-	disk->pentry_arr_bak = gpt_get_pentry_arr(disk->hdr_bak, fd);
+-	if (!disk->pentry_arr_bak) {
+-		fprintf(stderr, "%s: Failed to obtain backup partition entry array\n", __func__);
+-		goto error;
++int gpt_disk_copy(struct gpt_disk *dst, const struct gpt_disk *src)
++{
++	*dst = *src;
++	dst->hdr = malloc(src->block_size);
++	dst->hdr_bak = malloc(src->block_size);
++	dst->pentry_arr = malloc(src->pentry_arr_size);
++	dst->pentry_arr_bak = malloc(src->pentry_arr_size);
++	if (!dst->hdr || !dst->hdr_bak || !dst->pentry_arr || !dst->pentry_arr_bak) {
++		gpt_disk_free(dst);
++		return -1;
+ 	}
+-
+-	disk->pentry_size = GET_4_BYTES(disk->hdr + PENTRY_SIZE_OFFSET);
+-	disk->pentry_arr_size = GET_4_BYTES(disk->hdr + PARTITION_COUNT_OFFSET) * disk->pentry_size;
+-	disk->pentry_arr_crc = GET_4_BYTES(disk->hdr + PARTITION_CRC_OFFSET);
+-	disk->pentry_arr_bak_crc = GET_4_BYTES(disk->hdr_bak + PARTITION_CRC_OFFSET);
+-	disk->block_size = gpt_get_block_size(fd);
+-	close(fd);
+-	disk->is_initialized = GPT_DISK_INIT_MAGIC;
++	memcpy(dst->hdr, src->hdr, src->block_size);
++	memcpy(dst->hdr_bak, src->hdr_bak, src->block_size);
++	memcpy(dst->pentry_arr, src->pentry_arr, src->pentry_arr_size);
++	memcpy(dst->pentry_arr_bak, src->pentry_arr_bak, src->pentry_arr_size);
+ 	return 0;
+-error:
+-	if (fd >= 0)
+-		close(fd);
+-	return -1;
++}
++
++int gpt_disk_verify(const struct gpt_disk *disk)
++{
++	struct gpt_disk actual = { 0 };
++	int rc = -1;
++
++	if (!load_disk(disk->devpath, &actual) &&
++	    actual.block_size == disk->block_size &&
++	    actual.pentry_arr_size == disk->pentry_arr_size &&
++	    !memcmp(actual.hdr, disk->hdr, disk->block_size) &&
++	    !memcmp(actual.hdr_bak, disk->hdr_bak, disk->block_size) &&
++	    !memcmp(actual.pentry_arr, disk->pentry_arr, disk->pentry_arr_size) &&
++	    !memcmp(actual.pentry_arr_bak, disk->pentry_arr_bak, disk->pentry_arr_size))
++		rc = 0;
++	if (rc)
++		fprintf(stderr, "GPT readback mismatch on %s\n", disk->devpath);
++	gpt_disk_free(&actual);
++	return rc;
+ }
+ 
+ // Get pointer to partition entry from a allocated gpt_disk structure
+@@ -719,21 +584,22 @@ static int gpt_disk_update_crc(struct gpt_disk *disk)
+ 	     disk->pentry_arr_size, old_crc, disk->pentry_arr_crc);
+ 
+ 	// Update the partition CRC value in the primary GPT header
+-	PUT_4_BYTES(disk->hdr + PARTITION_CRC_OFFSET, disk->pentry_arr_crc);
++	put_le32(disk->hdr + PARTITION_CRC_OFFSET, disk->pentry_arr_crc);
+ 
+ 	// Update the partition CRC value in the backup GPT header
+-	PUT_4_BYTES(disk->hdr_bak + PARTITION_CRC_OFFSET, disk->pentry_arr_bak_crc);
++	put_le32(disk->hdr_bak + PARTITION_CRC_OFFSET, disk->pentry_arr_bak_crc);
+ 
+ 	// Update the CRC value of the primary header
+ 	gpt_header_size = GET_4_BYTES(disk->hdr + HEADER_SIZE_OFFSET);
+ 
+ 	// Header CRC is calculated with its own CRC field set to 0
+-	PUT_4_BYTES(disk->hdr + HEADER_CRC_OFFSET, 0);
+-	PUT_4_BYTES(disk->hdr_bak + HEADER_CRC_OFFSET, 0);
++	put_le32(disk->hdr + HEADER_CRC_OFFSET, 0);
++	put_le32(disk->hdr_bak + HEADER_CRC_OFFSET, 0);
+ 	disk->hdr_crc = efi_crc32(disk->hdr, gpt_header_size);
+-	disk->hdr_bak_crc = efi_crc32(disk->hdr_bak, gpt_header_size);
+-	PUT_4_BYTES(disk->hdr + HEADER_CRC_OFFSET, disk->hdr_crc);
+-	PUT_4_BYTES(disk->hdr_bak + HEADER_CRC_OFFSET, disk->hdr_bak_crc);
++	disk->hdr_bak_crc = efi_crc32(disk->hdr_bak,
++				     GET_4_BYTES(disk->hdr_bak + HEADER_SIZE_OFFSET));
++	put_le32(disk->hdr + HEADER_CRC_OFFSET, disk->hdr_crc);
++	put_le32(disk->hdr_bak + HEADER_CRC_OFFSET, disk->hdr_bak_crc);
+ 	return 0;
+ }
+ 
+@@ -752,46 +618,24 @@ int gpt_disk_commit(struct gpt_disk *disk)
+ 		goto error;
+ 	}
+ 
+-	fd = open(disk->devpath, O_RDWR);
++	fd = open(disk->devpath, O_RDWR | O_CLOEXEC);
+ 	if (fd < 0) {
+-		fprintf(stderr, "%s: Failed to open %s: %s\n", __func__, disk->devpath,
+-			strerror(errno));
+-		goto error;
+-	}
+-
+-	LOGD("%s: Writing back primary GPT header\n", __func__);
+-
+-	// Write the primary header
+-	if (gpt_set_header(disk->hdr, fd, PRIMARY_GPT) != 0) {
+-		fprintf(stderr, "%s: Failed to update primary GPT header\n", __func__);
+-		goto error;
+-	}
+-	LOGD("%s: Writing back primary partition array\n", __func__);
+-
+-	// Write back the primary partition array
+-	if (gpt_set_pentry_arr(disk->hdr, fd, disk->pentry_arr)) {
+-		fprintf(stderr, "%s: Failed to write primary GPT partition arr\n", __func__);
++		fprintf(stderr, "Failed to open %s: %s\n", disk->devpath, strerror(errno));
+ 		goto error;
+ 	}
+ 
+-	// Write the backup header
+-	if (gpt_set_header(disk->hdr_bak, fd, SECONDARY_GPT) != 0) {
+-		fprintf(stderr, "%s: Failed to update backup GPT header\n", __func__);
++	/* Keep one valid copy while writing the other. Write each header last. */
++	if (gpt_set_pentry_arr(disk->hdr_bak, fd, disk->pentry_arr_bak) ||
++	    gpt_set_header(disk->hdr_bak, fd, SECONDARY_GPT) ||
++	    fsync(fd) ||
++	    gpt_set_pentry_arr(disk->hdr, fd, disk->pentry_arr) ||
++	    gpt_set_header(disk->hdr, fd, PRIMARY_GPT) ||
++	    fsync(fd)) {
++		fprintf(stderr, "Failed to commit GPT on %s: %s\n", disk->devpath, strerror(errno));
+ 		goto error;
+ 	}
+-	LOGD("%s: Writing back backup partition array\n", __func__);
+-
+-	// Write back the backup partition array
+-	if (gpt_set_pentry_arr(disk->hdr_bak, fd, disk->pentry_arr_bak)) {
+-		fprintf(stderr, "%s: Failed to write backup GPT partition arr\n", __func__);
+-		goto error;
+-	}
+-
+-	LOGD("%s: Done\n", __func__);
+-
+-	fsync(fd);
+ 	close(fd);
+-	return 0;
++	return gpt_disk_verify(disk);
+ 
+ error:
+ 	if (fd >= 0)
+diff --git a/gpt-utils.h b/gpt-utils.h
+index b496d70..a2d1058 100644
+--- a/gpt-utils.h
++++ b/gpt-utils.h
+@@ -146,6 +146,8 @@ uint8_t *gpt_disk_get_pentry(struct gpt_disk *disk, const char *partname,
+ 
+ // Write the contents of struct gpt_disk back to the actual disk
+ int gpt_disk_commit(struct gpt_disk *disk);
++int gpt_disk_copy(struct gpt_disk *dst, const struct gpt_disk *src);
++int gpt_disk_verify(const struct gpt_disk *disk);
+ 
+ // Swtich betwieen using either the primary or the backup
+ // boot LUN for boot. This is required since UFS boot partitions
+diff --git a/qbootctl.c b/qbootctl.c
+index a369fbc..0e4ad8f 100644
+--- a/qbootctl.c
++++ b/qbootctl.c
+@@ -16,6 +16,9 @@
+  */
+ 
+ #include <errno.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <sys/file.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -27,49 +30,24 @@
+ 
+ const struct boot_control_module *impl = &bootctl;
+ 
+-bool isslot(const char* str)
++static int parse_slot(const char *arg)
+ {
+-	return strspn(str, "01abAB") == strlen(str);
+-}
+-
+-bool isslotnum(const char* str)
+-{
+-	return strspn(str, "01") == strlen(str);
+-}
+-
+-unsigned parseSlot(const char* arg)
+-{
+-	char *end;
+-	int slot;
+-	if (!isslot(arg)) {
+-		goto fail;
+-	}
+-	if (isslotnum(arg)) {
+-		slot = (int)strtol(arg, &end, 10);
+-		if (end == arg)
+-			goto fail;
+-	} else {
+-		switch (arg[0]) {
+-		case 'a':
+-		case 'A':
+-			slot = 0;
+-			break;
+-		case 'b':
+-		case 'B':
+-			slot = 1;
+-			break;
+-		default:
+-			goto fail;
+-		}
++	if (*arg == '_')
++		arg++;
++	if (strlen(arg) != 1)
++		return -1;
++	switch (*arg) {
++	case 'a':
++	case 'A':
++	case '0':
++		return 0;
++	case 'b':
++	case 'B':
++	case '1':
++		return 1;
++	default:
++		return -1;
+ 	}
+-
+-	return (unsigned)slot;
+-
+-fail:
+-	fprintf(stderr,
+-		"Expected slot not '%s'\n",
+-		arg);
+-	exit(1);
+ }
+ 
+ int usage()
+@@ -77,7 +55,7 @@ int usage()
+ 	// clang-format off
+ 	fprintf(stderr, "qbootctl: qcom bootctrl HAL port for Linux\n");
+ 	fprintf(stderr, "-------------------------------------------\n");
+-	fprintf(stderr, "qbootctl [-c|-m|-s|-u|-b|-n|-x] [SLOT]\n\n");
++	fprintf(stderr, "qbootctl [--dry-run] [-c|-a|-m|-s|-u|-b|-n|-x] [SLOT]\n\n");
+ 	fprintf(stderr, "    <no args>        dump slot info (default)\n");
+ 	fprintf(stderr, "    -h               this help text\n");
+ 	fprintf(stderr, "    -c               get the current slot\n");
+@@ -88,7 +66,7 @@ int usage()
+ 	fprintf(stderr, "    -s SLOT          set to active slot to SLOT\n");
+ 	fprintf(stderr, "    -m [SLOT]        mark a boot as successful (default: current)\n");
+ 	fprintf(stderr, "    -u [SLOT]        mark SLOT as unbootable (default: current)\n");
+-	fprintf(stderr, "    -i               still write the GPT headers even if the UFS bLun can't be changed (default: false)\n");
++	fprintf(stderr, "    --dry-run        plan and verify a slot switch without writing\n");
+ 	// clang-format on
+ 
+ 	return 1;
+@@ -97,8 +75,10 @@ int usage()
+ int get_slot_info(struct slot_info *slots)
+ {
+ 	int rc;
+-	uint32_t active_slot = impl->getActiveBootSlot();
++	int active_slot = impl->getActiveBootSlot();
+ 
++	if (active_slot < 0 || active_slot >= 2)
++		return -1;
+ 	slots[active_slot].active = true;
+ 
+ 	for (int i = 0; i < 2; i++) {
+@@ -115,11 +95,12 @@ int get_slot_info(struct slot_info *slots)
+ 	return 0;
+ }
+ 
+-static void dump_info(int current_slot)
++static int dump_info(int current_slot)
+ {
+ 	struct slot_info slots[2] = { { 0 } };
+ 
+-	get_slot_info(slots);
++	if (get_slot_info(slots))
++		return 1;
+ 
+ 	printf("Current slot: %s\n",
+ 	       current_slot >= 0 ? impl->getSuffix(current_slot) : "N/A");
+@@ -129,98 +110,123 @@ static void dump_info(int current_slot)
+ 		printf("\tSuccessful  : %d\n", slots[i].successful);
+ 		printf("\tBootable    : %d\n", slots[i].bootable);
+ 	}
++	return 0;
+ }
+ 
+-int main(int argc, char **argv)
++static int perform_action(int action, int slot, bool dry_run)
+ {
+-	int optflag;
+-	int slot = -1, current_slot;
+ 	int rc;
+-	bool ignore_missing_bsg = false;
+-
+-	if(geteuid() != 0) {
+-		fprintf(stderr, "This program must be run as root!\n");
+-		return 1;
+-	}
+-
+-	current_slot = impl->getCurrentSlot();
+-	if (current_slot < 0) {
+-		fprintf(stderr, "No slots found, is this an A/B device?\n");
+-		return 1;
+-	}
+-
+-	switch (argc) {
+-	case 1:
+-		dump_info(current_slot);
+-		return 0;
+-	case 2:
+-		break;
+-	case 3:
+-		slot = parseSlot(argv[2]);
+-		break;
+-	default:
+-		return usage();
+-	}
+-
+-	optflag = getopt(argc, argv, "hcmas:ub:n:x");
+-
+-	if (slot < 0 || optflag == 'c')
+-		slot = current_slot;
+ 
+-	switch (optflag) {
++	switch (action) {
+ 	case 'c':
+-		printf("Current slot: %s\n", impl->getSuffix(slot));
+-		return 0;
+ 	case 'a':
+-		slot = impl->getActiveBootSlot();
+-		printf("Active slot: %s\n", impl->getSuffix(slot));
++		printf("%s slot: %s\n", action == 'c' ? "Current" : "Active",
++		       impl->getSuffix(slot));
+ 		return 0;
+ 	case 'b':
+-		printf("SLOT %s: is %smarked bootable\n", impl->getSuffix(slot),
+-		       impl->isSlotBootable(slot) == 1 ? "" : "not ");
+-		return 0;
+ 	case 'n':
+-		printf("SLOT %s: is %smarked successful\n",
+-		       impl->getSuffix(slot),
+-		       impl->isSlotMarkedSuccessful(slot) == 1 ? "" : "not ");
++		rc = action == 'b' ? impl->isSlotBootable(slot) : impl->isSlotMarkedSuccessful(slot);
++		if (rc < 0)
++			return 1;
++		printf("SLOT %s: is %smarked %s\n", impl->getSuffix(slot), rc ? "" : "not ",
++		       action == 'b' ? "bootable" : "successful");
+ 		return 0;
+ 	case 'x':
+ 		printf("%s\n", impl->getSuffix(slot));
+ 		return 0;
+ 	case 's':
+-		rc = impl->setActiveBootSlot(slot, ignore_missing_bsg);
+-		if (rc < 0) {
+-			fprintf(stderr, "SLOT %s: Failed to set active\n",
+-				impl->getSuffix(slot));
++		rc = dry_run ? dry_run_set_active_boot_slot(slot) : impl->setActiveBootSlot(slot, false);
++		if (rc)
+ 			return 1;
+-		}
+-		printf("SLOT %d: Set as active slot\n", slot);
++		if (!dry_run)
++			printf("SLOT %d: Set as active slot\n", slot);
+ 		return 0;
+ 	case 'm':
+ 		rc = impl->markBootSuccessful(slot);
+-		if (rc < 0)
++		if (rc)
+ 			return 1;
+-		printf("SLOT %s: Marked boot successful\n",
+-		       impl->getSuffix(slot));
++		printf("SLOT %s: Marked boot successful\n", impl->getSuffix(slot));
+ 		return 0;
+ 	case 'u':
+ 		rc = impl->setSlotAsUnbootable(slot);
+-		if (rc < 0) {
+-			fprintf(stderr,
+-				"SLOT %s: Failed to set as unbootable\n",
+-				impl->getSuffix(slot));
++		if (rc)
+ 			return 1;
+-		}
+-		printf("SLOT %s: Set as unbootable\n", impl->getSuffix(slot));
++		printf("SLOT %s: Marked as unbootable\n", impl->getSuffix(slot));
+ 		return 0;
+-	case 'i':
+-		ignore_missing_bsg = true;
+-		break;
+-	case 'h':
+ 	default:
+-		usage();
+-		return 0;
++		return dump_info(slot);
+ 	}
++}
+ 
+-	return 0;
++int main(int argc, char **argv)
++{
++	static const struct option long_options[] = {
++		{"dry-run", no_argument, NULL, 'D'},
++		{"help", no_argument, NULL, 'h'},
++		{0},
++	};
++	int opt, action = 0, slot = -1, lock = -1, rc;
++	bool dry_run = false;
++
++	while ((opt = getopt_long(argc, argv, "hcabnxsmui", long_options, NULL)) != -1) {
++		switch (opt) {
++		case 'h':
++			usage();
++			return 0;
++		case 'D':
++			dry_run = true;
++			break;
++		case 'i':
++			fprintf(stderr, "Ignoring UFS boot LUN failures is no longer supported.\n");
++			return 1;
++		case 'c': case 'a': case 'b': case 'n': case 'x':
++		case 's': case 'm': case 'u':
++			if (action)
++				return usage();
++			action = opt;
++			break;
++		default:
++			return usage();
++		}
++	}
++
++	if (dry_run && action != 's')
++		return usage();
++	if (optind < argc) {
++		if (argc - optind != 1 || !action || action == 'a' || action == 'c')
++			return usage();
++		slot = parse_slot(argv[optind]);
++		if (slot < 0) {
++			fprintf(stderr, "Expected slot a, b, 0 or 1; got '%s'\n", argv[optind]);
++			return 1;
++		}
++	} else if (action == 's' || action == 'b' || action == 'n') {
++		fprintf(stderr, "A slot is required for -%c.\n", action);
++		return 1;
++	}
++
++	if (geteuid() != 0) {
++		fprintf(stderr, "This program must be run as root!\n");
++		return 1;
++	}
++	if (!dry_run && (action == 's' || action == 'm' || action == 'u')) {
++		lock = open("/run/qbootctl.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
++		if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) {
++			fprintf(stderr, "Cannot lock boot metadata: %s\n", strerror(errno));
++			if (lock >= 0)
++				close(lock);
++			return 1;
++		}
++	}
++	if (slot < 0)
++		slot = action == 'a' ? impl->getActiveBootSlot() : impl->getCurrentSlot();
++	if (slot < 0 || slot >= 2 || !*impl->getSuffix(slot)) {
++		fprintf(stderr, "No verified boot slot found.\n");
++		rc = 1;
++	} else {
++		rc = perform_action(action, slot, dry_run);
++	}
++	if (lock >= 0)
++		close(lock);
++	return rc;
+ }
+diff --git a/ufs-bsg.c b/ufs-bsg.c
+index 22c8da8..74ab5e1 100644
+--- a/ufs-bsg.c
++++ b/ufs-bsg.c
+@@ -27,159 +27,95 @@
+  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include <endian.h>
++#include <errno.h>
++#include <fcntl.h>
+ #include <linux/bsg.h>
+ #include <scsi/scsi_bsg_ufs.h>
+-#include <endian.h>
+-#include <dirent.h>
+-#include <string.h>
+-
++#include <stdbool.h>
++#include <stdint.h>
+ #include <stdio.h>
+-#include <stdlib.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+ #include <unistd.h>
+-#include <fcntl.h>
+-#include <errno.h>
+ 
+-#include "utils.h"
+ #include "ufs-bsg.h"
+ 
+-/* UFS BSG device node */
+-static char ufs_bsg_dev[FNAME_SZ] = "/dev/bsg/ufs-bsg0";
+-
+-static int fd_ufs_bsg = 0;
++#define UTP_UPIU_QUERY_RSP 0x36
+ 
+-int ufs_bsg_dev_open()
++static int query_boot_lun(uint32_t *value, bool write)
+ {
+-	if (fd_ufs_bsg)
+-		return 0;
+-
+-	fd_ufs_bsg = open(ufs_bsg_dev, O_RDWR);
+-	if (fd_ufs_bsg < 0) {
+-		fprintf(stderr, "Unable to open '%s': %s\n", ufs_bsg_dev,
+-			strerror(errno));
+-		fprintf(stderr,
+-			"Is CONFIG_SCSI_UFS_BSG is enabled in your kernel?\n");
+-		fd_ufs_bsg = 0;
+-		return -1;
+-	}
+-
+-	return 0;
+-}
+-
+-void ufs_bsg_dev_close()
+-{
+-	if (fd_ufs_bsg) {
+-		close(fd_ufs_bsg);
+-		fd_ufs_bsg = 0;
+-	}
+-}
+-
+-static int ufs_bsg_ioctl(int fd, struct ufs_bsg_request *req,
+-			 struct ufs_bsg_reply *rsp, __u8 *buf, __u32 buf_len,
+-			 enum bsg_ioctl_dir dir)
+-{
+-	int ret;
+-	struct sg_io_v4 sg_io = {
++	const char *dev = "/dev/bsg/ufs-bsg0";
++	struct ufs_bsg_request request = { 0 };
++	struct ufs_bsg_reply reply = { 0 };
++	struct sg_io_v4 io = {
+ 		.guard = 'Q',
+ 		.protocol = BSG_PROTOCOL_SCSI,
+ 		.subprotocol = BSG_SUB_PROTOCOL_SCSI_TRANSPORT,
+-		.request_len = sizeof(*req),
+-		.request = (__u64)req,
+-		.response = (__u64)rsp,
+-		.max_response_len = sizeof(*rsp),
++		.request_len = sizeof(request),
++		.request = (uintptr_t)&request,
++		.max_response_len = sizeof(reply),
++		.response = (uintptr_t)&reply,
++		.timeout = 20000,
+ 	};
+-
+-	if (dir == BSG_IOCTL_DIR_FROM_DEV) {
+-		sg_io.din_xfer_len = buf_len;
+-		sg_io.din_xferp = (__u64)(buf);
+-	} else {
+-		sg_io.dout_xfer_len = buf_len;
+-		sg_io.dout_xferp = (__u64)(buf);
++	int rc;
++	int fd;
++
++	request.msgcode = UTP_UPIU_QUERY_REQ;
++	request.upiu_req.header.dword_0 = DWORD(UTP_UPIU_QUERY_REQ, 0, 0, 0);
++	request.upiu_req.header.dword_1 = DWORD(0,
++		write ? QUERY_REQ_FUNC_STD_WRITE : QUERY_REQ_FUNC_STD_READ, 0, 0);
++	request.upiu_req.qr.opcode = write ? QUERY_REQ_OP_WRITE_ATTR : QUERY_REQ_OP_READ_ATTR;
++	request.upiu_req.qr.idn = QUERY_ATTR_IDN_BOOT_LU_EN;
++	if (write)
++		request.upiu_req.qr.value = htobe32(*value);
++
++	/* Some kernels require a writable descriptor for transport ioctls. */
++	fd = open(dev, O_RDWR | O_CLOEXEC);
++	if (fd < 0) {
++		rc = -errno;
++		fprintf(stderr, "Unable to open %s: %s\n", dev, strerror(-rc));
++		return rc;
+ 	}
+-
+-	ret = ioctl(fd, SG_IO, &sg_io);
+-	if (ret)
+-		fprintf(stderr,
+-			"%s: Error from sg_io ioctl (return value: %d, error no: %d, reply result from LLD: %d\n)",
+-			__func__, ret, errno, rsp->result);
+-
+-	if (sg_io.info || rsp->result) {
+-		fprintf(stderr,
+-			"%s: Error from sg_io info (check sg info: device_status: 0x%x, transport_status: 0x%x, driver_status: 0x%x, reply result from LLD: %d\n)",
+-			__func__, sg_io.device_status, sg_io.transport_status,
+-			sg_io.driver_status, rsp->result);
+-		ret = -EAGAIN;
++	rc = ioctl(fd, SG_IO, &io);
++	if (rc < 0) {
++		rc = -errno;
++	} else if (rc || io.device_status || io.transport_status || io.driver_status ||
++		   reply.result || io.response_len < sizeof(reply) ||
++		   (be32toh(reply.upiu_rsp.header.dword_0) >> 24) != UTP_UPIU_QUERY_RSP ||
++		   (be32toh(reply.upiu_rsp.header.dword_1) & 0xffff)) {
++		rc = -EIO;
++	} else if (!write) {
++		*value = be32toh(reply.upiu_rsp.qr.value);
+ 	}
++	close(fd);
+ 
+-	return ret;
+-}
+-
+-static void compose_ufs_bsg_query_req(struct ufs_bsg_request *req, __u8 func,
+-				      __u8 opcode, __u8 idn, __u8 index,
+-				      __u8 sel, __u16 length)
+-{
+-	struct utp_upiu_header *hdr = &req->upiu_req.header;
+-	struct utp_upiu_query *qr = &req->upiu_req.qr;
+-
+-	req->msgcode = UTP_UPIU_QUERY_REQ;
+-	hdr->dword_0 = DWORD(UTP_UPIU_QUERY_REQ, 0, 0, 0);
+-	hdr->dword_1 = DWORD(0, func, 0, 0);
+-	hdr->dword_2 = DWORD(0, 0, length >> 8, (__u8)length);
+-	qr->opcode = opcode;
+-	qr->idn = idn;
+-	qr->index = index;
+-	qr->selector = sel;
+-	qr->length = htobe16(length);
++	if (rc)
++		fprintf(stderr, "Unable to %s UFS boot LUN: %s\n",
++			write ? "write" : "read", strerror(-rc));
++	return rc;
+ }
+ 
+-static int ufs_query_attr(int fd, __u32 value, __u8 func, __u8 opcode, __u8 idn,
+-			  __u8 index, __u8 sel)
++int read_boot_lun(uint8_t *lun)
+ {
+-	struct ufs_bsg_request req = { 0 };
+-	struct ufs_bsg_reply rsp = { 0 };
+-	enum bsg_ioctl_dir dir = BSG_IOCTL_DIR_FROM_DEV;
+-	int ret = 0;
+-
+-	if (opcode == QUERY_REQ_OP_WRITE_DESC ||
+-	    opcode == QUERY_REQ_OP_WRITE_ATTR)
+-		dir = BSG_IOCTL_DIR_TO_DEV;
+-
+-	req.upiu_req.qr.value = htobe32(value);
+-
+-	compose_ufs_bsg_query_req(&req, func, opcode, idn, index, sel, 0);
+-
+-	ret = ufs_bsg_ioctl(fd, &req, &rsp, 0, 0, dir);
+-	if (ret)
+-		fprintf(stderr,
+-			"%s: Error from ufs_bsg_ioctl (return value: %d, error no: %d\n)",
+-			__func__, ret, errno);
+-
+-	return ret;
++	uint32_t value;
++	int rc = query_boot_lun(&value, false);
++
++	if (rc)
++		return rc;
++	if (value != 1 && value != 2) {
++		fprintf(stderr, "Unexpected UFS boot LUN: %u\n", value);
++		return -EINVAL;
++	}
++	*lun = value;
++	return 0;
+ }
+ 
+-int32_t set_boot_lun(__u8 lun_id)
++int set_boot_lun(uint8_t lun)
+ {
+-	int32_t ret;
+-	__u32 boot_lun_id = lun_id;
+-
+-	LOGD("Using UFS bsg device: %s\n", ufs_bsg_dev);
+-
+-	ret = ufs_bsg_dev_open();
+-	if (ret)
+-		return ret;
+-	LOGD("Opened ufs bsg dev: %s\n", ufs_bsg_dev);
+-
+-	ret = ufs_query_attr(fd_ufs_bsg, boot_lun_id, QUERY_REQ_FUNC_STD_WRITE,
+-			     QUERY_REQ_OP_WRITE_ATTR, QUERY_ATTR_IDN_BOOT_LU_EN,
+-			     0, 0);
+-	if (ret)
+-		fprintf(stderr,
+-			"Error requesting ufs attr idn %d via query ioctl (return value: %d, error no: %d)",
+-			QUERY_ATTR_IDN_BOOT_LU_EN, ret, errno);
+-
++	uint32_t value = lun;
+ 
+-	ufs_bsg_dev_close();
+-	return ret;
++	if (lun != 1 && lun != 2)
++		return -EINVAL;
++	return query_boot_lun(&value, true);
+ }
+diff --git a/ufs-bsg.h b/ufs-bsg.h
+index fdbe31e..fddafdb 100644
+--- a/ufs-bsg.h
++++ b/ufs-bsg.h
+@@ -1,91 +1,94 @@
+-#ifndef __RECOVERY_UFS_BSG_H__
+-#define __RECOVERY_UFS_BSG_H__
+-
+-/*
+- * Copyright (c) 2020 The Linux Foundation. All rights reserved.
+- *
+- * Redistribution and use in source and binary forms, with or without
+- * modification, are permitted provided that the following conditions are
+- * met:
+- *     * Redistributions of source code must retain the above copyright
+- *       notice, this list of conditions and the following disclaimer.
+- *     * Redistributions in binary form must reproduce the above
+- *       copyright notice, this list of conditions and the following
+- *       disclaimer in the documentation and/or other materials provided
+- *       with the distribution.
+- *     * Neither the name of The Linux Foundation nor the names of its
+- *       contributors may be used to endorse or promote products derived
+- *       from this software without specific prior written permission.
+- *
+- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
+- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
+- * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
+- * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+- * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+- * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+- * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+- */
+-
+-#define FNAME_SZ	      64
+-
+-#define SG_IO		      0x2285
+-
+-#define DWORD(b3, b2, b1, b0) htobe32((b3 << 24) | (b2 << 16) | (b1 << 8) | b0)
+-
+-/* UPIU Transaction Codes */
+-enum {
+-	UTP_UPIU_NOP_OUT = 0x00,
+-	UTP_UPIU_COMMAND = 0x01,
+-	UTP_UPIU_DATA_OUT = 0x02,
+-	UTP_UPIU_TASK_REQ = 0x04,
+-	UTP_UPIU_QUERY_REQ = 0x16,
+-};
+-
+-/* UPIU Query Function field */
+-enum {
+-	QUERY_REQ_FUNC_STD_READ = 0x01,
+-	QUERY_REQ_FUNC_STD_WRITE = 0x81,
+-};
+-
+-enum query_req_opcode {
+-	QUERY_REQ_OP_READ_DESC = 0x1,
+-	QUERY_REQ_OP_WRITE_DESC = 0x2,
+-	QUERY_REQ_OP_READ_ATTR = 0x3,
+-	QUERY_REQ_OP_WRITE_ATTR = 0x4,
+-	QUERY_REQ_OP_READ_FLAG = 0x5,
+-	QUERY_REQ_OP_SET_FLAG = 0x6,
+-	QUERY_REQ_OP_CLEAR_FLAG = 0x7,
+-	QUERY_REQ_OP_TOGGLE_FLAG = 0x8,
+-};
+-
+-enum query_desc_idn {
+-	QUERY_DESC_IDN_DEVICE = 0x0,
+-	QUERY_DESC_IDN_UNIT = 0x2,
+-	QUERY_DESC_IDN_GEOMETRY = 0x7,
+-};
+-
+-enum query_desc_size {
+-	QUERY_DESC_SIZE_DEVICE = 0x40,
+-	QUERY_DESC_SIZE_GEOMETRY = 0x48,
+-	QUERY_DESC_SIZE_UNIT = 0x23,
+-};
+-
+-enum bsg_ioctl_dir {
+-	BSG_IOCTL_DIR_TO_DEV,
+-	BSG_IOCTL_DIR_FROM_DEV,
+-};
+-
+-enum query_attr_idn {
+-	QUERY_ATTR_IDN_BOOT_LU_EN = 0x00,
+-	QUERY_ATTR_IDN_RESERVED = 0x01,
+-	QUERY_ATTR_IDN_POWER_MODE = 0x02,
+-	QUERY_ATTR_IDN_ACTIVE_ICC_LVL = 0x03,
+-};
+-
+-int ufs_bsg_dev_open();
+-
+-#endif /* __RECOVERY_UFS_BSG_H__ */
++#ifndef __RECOVERY_UFS_BSG_H__
++#define __RECOVERY_UFS_BSG_H__
++
++/*
++ * Copyright (c) 2020 The Linux Foundation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ *       copyright notice, this list of conditions and the following
++ *       disclaimer in the documentation and/or other materials provided
++ *       with the distribution.
++ *     * Neither the name of The Linux Foundation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
++ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
++ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#define FNAME_SZ	      64
++
++#define SG_IO		      0x2285
++
++#define DWORD(b3, b2, b1, b0) \
++	htobe32(((uint32_t)(b3) << 24) | ((uint32_t)(b2) << 16) | \
++		((uint32_t)(b1) << 8) | (uint32_t)(b0))
++
++/* UPIU Transaction Codes */
++enum {
++	UTP_UPIU_NOP_OUT = 0x00,
++	UTP_UPIU_COMMAND = 0x01,
++	UTP_UPIU_DATA_OUT = 0x02,
++	UTP_UPIU_TASK_REQ = 0x04,
++	UTP_UPIU_QUERY_REQ = 0x16,
++};
++
++/* UPIU Query Function field */
++enum {
++	QUERY_REQ_FUNC_STD_READ = 0x01,
++	QUERY_REQ_FUNC_STD_WRITE = 0x81,
++};
++
++enum query_req_opcode {
++	QUERY_REQ_OP_READ_DESC = 0x1,
++	QUERY_REQ_OP_WRITE_DESC = 0x2,
++	QUERY_REQ_OP_READ_ATTR = 0x3,
++	QUERY_REQ_OP_WRITE_ATTR = 0x4,
++	QUERY_REQ_OP_READ_FLAG = 0x5,
++	QUERY_REQ_OP_SET_FLAG = 0x6,
++	QUERY_REQ_OP_CLEAR_FLAG = 0x7,
++	QUERY_REQ_OP_TOGGLE_FLAG = 0x8,
++};
++
++enum query_desc_idn {
++	QUERY_DESC_IDN_DEVICE = 0x0,
++	QUERY_DESC_IDN_UNIT = 0x2,
++	QUERY_DESC_IDN_GEOMETRY = 0x7,
++};
++
++enum query_desc_size {
++	QUERY_DESC_SIZE_DEVICE = 0x40,
++	QUERY_DESC_SIZE_GEOMETRY = 0x48,
++	QUERY_DESC_SIZE_UNIT = 0x23,
++};
++
++enum bsg_ioctl_dir {
++	BSG_IOCTL_DIR_TO_DEV,
++	BSG_IOCTL_DIR_FROM_DEV,
++};
++
++enum query_attr_idn {
++	QUERY_ATTR_IDN_BOOT_LU_EN = 0x00,
++	QUERY_ATTR_IDN_RESERVED = 0x01,
++	QUERY_ATTR_IDN_POWER_MODE = 0x02,
++	QUERY_ATTR_IDN_ACTIVE_ICC_LVL = 0x03,
++};
++
++int read_boot_lun(uint8_t *lun);
++int set_boot_lun(uint8_t lun);
++
++#endif /* __RECOVERY_UFS_BSG_H__ */

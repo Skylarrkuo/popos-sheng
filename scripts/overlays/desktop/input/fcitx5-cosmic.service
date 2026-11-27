@@ -1,0 +1,13 @@
+[Unit]
+Description=Fcitx 5 for the COSMIC session
+PartOf=cosmic-session.target
+After=graphical-session-pre.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+ExecStart=/usr/bin/fcitx5 --replace
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=cosmic-session.target

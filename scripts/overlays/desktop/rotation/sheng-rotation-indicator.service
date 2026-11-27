@@ -1,0 +1,14 @@
+[Unit]
+Description=Sheng screen rotation switch for the COSMIC status area
+PartOf=cosmic-session.target
+After=graphical-session-pre.target sheng-screen-rotation.service
+Wants=sheng-screen-rotation.service
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+ExecStart=/usr/libexec/sheng-rotation-indicator
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=cosmic-session.target

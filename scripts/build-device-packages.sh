@@ -128,6 +128,7 @@ EOF
 for component in firmware audio platform; do
     dpkg-deb -Zxz -z3 --build --root-owner-group "$stage/$component" "$stage"
 done
+bash "$repo/scripts/build-desktop-package.sh" "$stage"
 for deb in "$stage"/*.deb; do
     mv -- "$deb" "$pool/"
     device_packages+=("$(basename "$deb")")

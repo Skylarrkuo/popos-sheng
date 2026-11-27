@@ -1,0 +1,13 @@
+[Unit]
+Description=Sheng internal display rotation for COSMIC
+PartOf=cosmic-session.target
+After=graphical-session-pre.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+ExecStart=/usr/bin/sheng-screen-rotation watch
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=cosmic-session.target

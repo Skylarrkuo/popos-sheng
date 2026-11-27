@@ -1,0 +1,14 @@
+[Unit]
+Description=Sheng SSC accelerometer stream
+
+[Service]
+ExecStart=/usr/libexec/sheng-rotation-sensor-stream
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RuntimeMaxSec=610
+TimeoutStopSec=3

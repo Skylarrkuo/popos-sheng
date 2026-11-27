@@ -76,6 +76,54 @@ pwsh -File .\Build-Visible.ps1 -CosmicDeb 'C:\path\to\cosmic-settings_arm64.deb'
 
 本地输出在 `out/`，两份 `.img` 可直接交给 Fastboot。Linux 构建可通过 `SHENG_POP_ISO` 指向已下载的 ISO，通过 `SHENG_POP_ISO_URL` 指定同一固定文件的下载镜像。`SHENG_POP_WORK` 用来选择临时目录，修改输入版本时请使用新的工作目录。`SHENG_POP_JOBS` 调整内核编译并发数。`SHENG_POP_QEMU_AARCH64` 可指定静态用户态模拟器的绝对路径。
 
+### 自动旋转和中文拼音
+
+`popos-sheng-desktop` 随镜像安装。COSMIC 顶栏的旋转图标左键切换自动旋转和方向锁定，右键可打开菜单和固定方向设置。旋转使用内置加速度计，默认启用自动模式。
+
+中文输入使用 Fcitx 5 和离线拼音，预设浅色高对比度候选框。用 **Alt + 空格** 或输入法菜单切换拼音。镜像为默认用户和新建用户预置输入法配置。
+
+### 从 COSMIC 重启到 Android
+
+在应用程序菜单搜索 **重启到 Android**。确认并通过管理员验证后，已校准的设备会检查启动分区和 UFS 启动槽，再切换到 Android A 槽并重启。公开镜像提供启动入口，需要为每台设备配置独立校准。
+
+已经用设备专用版 `qbootctl-sheng` 验证过 A/B 切换的设备，可以用以下三个文件构建专用镜像。校准只适用于采集它的平板及对应的启动分区状态。
+
+| 文件 | 内容 |
+| --- | --- |
+| `qbootctl-sheng` | 已在该设备通过 B→A 只读预检的 ARM64 可执行文件 |
+| `boot.sha256` | 该设备为切槽预检登记的启动分区 SHA-256 清单 |
+| `boot-b-image.sha256` | 与平板 B 槽启动镜像前缀一致的 `boot-popos-sheng-dual.img` 的 SHA-256 和文件字节数，两者以空格分隔 |
+
+把这三个文件放在本地忽略目录 `inputs/local-slot-bundle/`。当内核和启动镜像沿用已校验的构建时，Windows 可在 `Build-Visible.ps1 -Stage Rootfs` 的原参数末尾加上 `-SlotBundle inputs/local-slot-bundle`。在 Linux 上可使用以下命令。
+
+```bash
+sudo env SHENG_POP_SLOT_BUNDLE="$PWD/inputs/local-slot-bundle" bash scripts/build-image.sh
+```
+
+刷入专用镜像后，可在 Pop!_OS 运行 `sudo /usr/libexec/sheng-reboot-android --check` 只读核对。A 槽固件或 B 槽引导镜像改动后，需要重新验证并登记。GitHub Actions 使用公用构建路径，校准文件保存在本地。
+
+公开镜像刷入后，也可在设备上安装已经验证的校准，并运行同一项预检。
+
+```bash
+sudo install -D -o root -g root -m 0755 qbootctl-sheng /usr/local/sbin/qbootctl-sheng
+sudo install -D -o root -g root -m 0644 boot.sha256 /etc/qbootctl-sheng/boot.sha256
+sudo /usr/libexec/sheng-reboot-android --check
+```
+
+设备专用切槽工具的源码由 [qbootctl 上游源码](https://github.com/linux-msm/qbootctl/tree/39a6e6daaf029fb0a083777679a15ea2c18f72de) 和 [Sheng 补丁](patches/qbootctl-sheng.patch) 组成。持有同一设备的 A/B GPT 校准快照时，可用下列命令编译，x86-64 主机需安装 `gcc-aarch64-linux-gnu`。
+
+```bash
+git clone https://github.com/linux-msm/qbootctl.git
+mkdir -p inputs/local-slot-bundle
+python3 scripts/slot-calibration/build-sheng-profile.py \
+  --slot-a inputs/slot-a.json --slot-b inputs/slot-b.json \
+  --output inputs/local-slot-bundle/sheng-profile-data.h
+bash scripts/build-slot-tool.sh qbootctl inputs/local-slot-bundle/sheng-profile-data.h \
+  inputs/local-slot-bundle/qbootctl-sheng
+```
+
+如有同一设备从 Android 返回 B 槽后的已验证快照，通过 `--slot-b-alternate` 一起传给生成器。快照、生成的头文件和设备专用工具应保存在 `inputs/`。 [GPT 快照校验器](scripts/slot-calibration/audit-sheng.py)
+
 ### 使用本地 APT 仓库
 
 将 `apt-local/` 整个目录复制到平板，作为本地 `file:` 软件源使用。套件写 `./`，`Signed-By` 指向这次构建的 `popos-sheng-archive.gpg`。可用 `SIGNING-KEY-FINGERPRINT.txt` 核对公钥指纹，`local-apt-policy.txt` 记录构建时 APT 选中的内核包。GitHub Actions 每次运行会在 runner 上生成该次构建的签名密钥，产物包含公钥和签名。

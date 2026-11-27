@@ -1,0 +1,244 @@
+#!/usr/bin/python3
+import os
+from pathlib import Path
+import sys
+from time import monotonic
+
+from gi.repository import Gio, GioUnix, GLib
+
+
+ROTATION = "/usr/bin/sheng-screen-rotation"
+STATE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "sheng-screen-rotation" / "mode"
+BUS_NAME = "org.sheng.ScreenRotationIndicator"
+ITEM = "org.kde.StatusNotifierItem"
+OBJECT = "/StatusNotifierItem"
+MENU = "com.canonical.dbusmenu"
+MENU_OBJECT = "/Menu"
+MENU_ACTIONS = {
+    1: ("自动旋转", "auto"),
+    2: ("锁定当前方向", "lock"),
+    4: ("打开屏幕旋转设置…", "gui"),
+}
+LAYOUT_TYPE = "(ia{sv}av)"
+WATCHER = "org.kde.StatusNotifierWatcher"
+ICONS = Path("/usr/share/icons/Pop/scalable/status")
+INTERFACE = Gio.DBusNodeInfo.new_for_xml(f"""<node><interface name="{ITEM}">
+  <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="ProvideXdgActivationToken"><arg type="s" direction="in"/></method>
+  <property name="Category" type="s" access="read"/>
+  <property name="Id" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/>
+  <property name="Menu" type="o" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+  <signal name="NewIcon"/>
+  <signal name="NewTitle"/>
+  <signal name="NewToolTip"/>
+</interface></node>""").interfaces[0]
+
+
+MENU_INTERFACE = Gio.DBusNodeInfo.new_for_xml(f"""<node><interface name="{MENU}">
+  <method name="GetLayout">
+    <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+    <arg type="u" direction="out"/><arg type="{LAYOUT_TYPE}" direction="out"/>
+  </method>
+  <method name="Event">
+    <arg type="i" direction="in"/><arg type="s" direction="in"/>
+    <arg type="v" direction="in"/><arg type="u" direction="in"/>
+  </method>
+  <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+  <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+  <signal name="ItemsPropertiesUpdated"><arg type="a(ia{{sv}})"/><arg type="a(ias)"/></signal>
+</interface></node>""").interfaces[0]
+
+
+def current_mode():
+    try:
+        return STATE.read_text().strip()
+    except FileNotFoundError:
+        return "auto"
+
+
+class Indicator:
+    def __init__(self, connection):
+        self.bus = connection
+        STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.mode = current_mode()
+        self.switching = False
+        self.menu_revision = 1
+        self.activation_token = None
+        self.bus.register_object(OBJECT, INTERFACE, self.invoke, self.property, None)
+        self.bus.register_object(MENU_OBJECT, MENU_INTERFACE, self.menu_call, None, None)
+        self.monitor = Gio.File.new_for_path(str(STATE.parent)).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.monitor.connect("changed", self.changed)
+        self.watcher = Gio.bus_watch_name_on_connection(
+            self.bus, WATCHER, Gio.BusNameWatcherFlags.NONE, self.register, None
+        )
+
+    def register(self, connection, _name, owner):
+        connection.call(
+            owner, "/StatusNotifierWatcher", WATCHER, "RegisterStatusNotifierItem",
+            GLib.Variant("(s)", (OBJECT,)), None, Gio.DBusCallFlags.NONE, 4000, None,
+            self.registered, None,
+        )
+
+    @staticmethod
+    def registered(connection, result, _data):
+        try:
+            connection.call_finish(result)
+        except GLib.Error as error:
+            print(f"Status area registration failed: {error.message}", file=sys.stderr, flush=True)
+
+    def changed(self, _monitor, path, other, _event):
+        if str(STATE) == path.get_path() or (other and str(STATE) == other.get_path()):
+            self.sync()
+
+    def sync(self):
+        mode = current_mode()
+        if mode != self.mode:
+            self.mode = mode
+            for signal in ("NewIcon", "NewTitle", "NewToolTip"):
+                self.bus.emit_signal(None, OBJECT, ITEM, signal, None)
+            self.menu_revision += 1
+            self.bus.emit_signal(
+                None, MENU_OBJECT, MENU, "LayoutUpdated",
+                GLib.Variant("(ui)", (self.menu_revision, 0)),
+            )
+
+    def property(self, _connection, _sender, _path, _interface, name):
+        automatic = self.mode == "auto"
+        asset = "rotation-allowed-symbolic.svg" if automatic else "rotation-locked-symbolic.svg"
+        title = "自动旋转已开启" if automatic else "屏幕方向已锁定"
+        if name == "ItemIsMenu":
+            return GLib.Variant("b", False)
+        if name == "Menu":
+            return GLib.Variant("o", MENU_OBJECT)
+        if name == "ToolTip":
+            action = "点击锁定当前方向" if automatic else "点击启用自动旋转"
+            return GLib.Variant("(sa(iiay)ss)", (str(ICONS / asset), [], title, action + "，右键打开设置菜单"))
+        value = {
+            "Category": "SystemServices",
+            "Id": "sheng-screen-rotation",
+            "Status": "Active",
+            "Title": title,
+            "IconName": str(ICONS / asset),
+        }[name]
+        return GLib.Variant("s", value)
+
+    def menu_layout(self, parent, depth, properties):
+        children = []
+        if parent == 0:
+            values = {"children-display": GLib.Variant("s", "submenu")}
+            if depth != 0:
+                children = [
+                    GLib.Variant(LAYOUT_TYPE, self.menu_layout(item, 0, properties))
+                    for item in (1, 2, 3, 4)
+                ]
+        elif parent == 3:
+            values = {"type": GLib.Variant("s", "separator")}
+        else:
+            label, action = MENU_ACTIONS[parent]
+            values = {"label": GLib.Variant("s", label)}
+            if action != "gui":
+                active = (self.mode == "auto") == (action == "auto")
+                values["toggle-type"] = GLib.Variant("s", "radio")
+                values["toggle-state"] = GLib.Variant("i", int(active))
+        if properties:
+            values = {key: value for key, value in values.items() if key in properties}
+        return parent, values, children
+
+    def menu_call(self, _connection, sender, _path, _interface, method, params, reply):
+        if method == "GetLayout":
+            parent, depth, properties = params.unpack()
+            if parent not in (0, 1, 2, 3, 4):
+                reply.return_dbus_error(f"{MENU}.InvalidMenuItem", "Unknown rotation menu item")
+                return
+            self.sync()
+            layout = self.menu_layout(parent, depth, properties)
+            reply.return_value(GLib.Variant(f"(u{LAYOUT_TYPE})", (self.menu_revision, layout)))
+        elif method == "AboutToShow":
+            self.sync()
+            reply.return_value(GLib.Variant("(b)", (False,)))
+        else:
+            item, event, _, _ = params.unpack()
+            if event == "clicked" and item in MENU_ACTIONS:
+                self.run_action(MENU_ACTIONS[item][1], sender, reply, "menu")
+            else:
+                reply.return_value(None)
+
+    def invoke(self, _connection, sender, _path, _interface, method, params, reply):
+        if method == "ProvideXdgActivationToken":
+            self.activation_token = (sender, params.unpack()[0], monotonic() + 5)
+            reply.return_value(None)
+        else:
+            action = "lock" if current_mode() == "auto" else "auto"
+            self.run_action(action, sender, reply, "icon")
+
+    def run_action(self, action, sender, reply, origin):
+        token = None
+        if self.activation_token and self.activation_token[0] == sender:
+            _, value, expires = self.activation_token
+            self.activation_token = None
+            if monotonic() < expires:
+                token = value
+
+        if action == "gui":
+            try:
+                app = GioUnix.DesktopAppInfo.new("sheng-screen-rotation.desktop")
+                if app is None:
+                    reply.return_dbus_error(f"{BUS_NAME}.Failed", "Screen Rotation settings were not found")
+                    return
+                context = Gio.AppLaunchContext()
+                if token:
+                    context.setenv("XDG_ACTIVATION_TOKEN", token)
+                app.launch([], context)
+                print(f"Rotation menu from {sender}: opened settings", flush=True)
+                reply.return_value(None)
+            except GLib.Error as error:
+                reply.return_dbus_error(f"{BUS_NAME}.Failed", error.message)
+            return
+        if self.switching:
+            reply.return_value(None)
+            return
+        try:
+            process = Gio.Subprocess.new(
+                [ROTATION, action], Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_PIPE
+            )
+        except GLib.Error as error:
+            reply.return_dbus_error(f"{BUS_NAME}.Failed", error.message)
+            return
+        self.switching = True
+        process.communicate_utf8_async(None, None, self.activated, (sender, reply, origin))
+
+    def activated(self, process, result, context):
+        sender, reply, origin = context
+        self.switching = False
+        try:
+            _, _, error = process.communicate_utf8_finish(result)
+            if not process.get_successful():
+                reply.return_dbus_error(f"{BUS_NAME}.Failed", (error or "Rotation switch failed").strip())
+                return
+            self.sync()
+            print(f"Rotation {origin} from {sender}: {self.mode}", flush=True)
+            reply.return_value(None)
+        except GLib.Error as error:
+            reply.return_dbus_error(f"{BUS_NAME}.Failed", error.message)
+
+
+def main():
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    result = bus.call_sync(
+        "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+        "RequestName", GLib.Variant("(su)", (BUS_NAME, 4)), GLib.VariantType.new("(u)"),
+        Gio.DBusCallFlags.NONE, 3000, None,
+    )
+    if result.unpack()[0] != 1:
+        raise RuntimeError(f"Could not acquire {BUS_NAME}")
+    indicator = Indicator(bus)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

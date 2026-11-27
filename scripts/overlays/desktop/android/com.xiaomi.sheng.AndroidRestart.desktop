@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Restart into Android…
+Name[zh_CN]=重启到 Android…
+Comment=Switch to Android on slot A and restart
+Comment[zh_CN]=切换到 Android 的 A 槽并重启
+Exec=/usr/bin/sheng-android-menu
+TryExec=/usr/bin/sheng-android-menu
+Icon=system-reboot-symbolic
+Terminal=false
+Keywords=Android;Restart;Reboot;
+Keywords[zh_CN]=安卓;重启;切槽;Android;
+StartupNotify=true

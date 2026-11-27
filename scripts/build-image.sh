@@ -20,6 +20,7 @@ apt_build_config=$root/etc/apt/apt.conf.d/99zz-popos-sheng-build
 username=starin
 sparse=rootfs-popos-26.04-cosmic-sheng-linux.img
 boot=boot-popos-sheng-dual.img
+apt_options=(-o Acquire::Retries=1 -o Acquire::https::Timeout=20)
 
 test -s "$image"
 test -f "$work/iso-ready"
@@ -27,6 +28,12 @@ test -s "$work/device-debs.txt"
 settings_debs=("$pool"/cosmic-settings_*+sheng1_arm64.deb)
 [[ ${#settings_debs[@]} == 1 && -f ${settings_debs[0]} ]]
 settings_version=$(dpkg-deb -f "${settings_debs[0]}" Version)
+mapfile -t desktop_debs < <(grep -E '^popos-sheng-desktop_[0-9.]+_all\.deb$' "$work/device-debs.txt")
+[[ ${#desktop_debs[@]} == 1 && -s "$pool/${desktop_debs[0]}" ]]
+desktop_deb=${desktop_debs[0]}
+if [[ -n ${SHENG_POP_SLOT_BUNDLE:-} ]]; then
+    python3 "$repo/scripts/verify-slot-bundle.py" "$SHENG_POP_SLOT_BUNDLE" "$output/$boot"
+fi
 exec 9>"$work/rootfs.lock"
 flock -n 9
 exec > >(tee -a "$output/image-build.log") 2>&1
@@ -53,6 +60,18 @@ attach() {
 }
 inside() {
     chroot "$root" /usr/bin/env LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive "$@"
+}
+
+refresh_apt() {
+    # The target will refresh these optional catalogs natively after boot.
+    printf '#clear APT::Update::Post-Invoke-Success;\n' > "$apt_build_config"
+    if ! inside apt-get "${apt_options[@]}" update --error-on=any; then
+        echo 'Refresh signed Ubuntu ARM64 indexes for the device package dependencies'
+        inside apt-get "${apt_options[@]}" \
+            -o Dir::Etc::SourceList=/etc/apt/sources.list.d/system.sources \
+            -o Dir::Etc::SourceParts=- -o APT::Get::List-Cleanup=0 update --error-on=any
+    fi
+    rm -f -- "$apt_build_config"
 }
 
 if [[ $(uname -m) != aarch64 && ! -f $binfmt/qemu-aarch64 ]]; then
@@ -91,20 +110,12 @@ if [[ ! -f $work/device-configured-v2 ]]; then
     echo '[Image 1/4] Install the Sheng drivers, COSMIC Settings, and TuneD power backend'
     sed -i -e 's|^URIs: http://ports.ubuntu.com/|URIs: https://ports.ubuntu.com/|' \
         -e 's|^URIs: http://apt.pop-os.org/|URIs: https://apt.pop-os.org/|' "$root/etc/apt/sources.list.d/"*.sources
-    apt_options=(-o Acquire::Retries=1 -o Acquire::https::Timeout=20)
-    # The target will refresh these optional catalogs natively after boot.
-    printf '#clear APT::Update::Post-Invoke-Success;\n' > "$apt_build_config"
-    if ! inside apt-get "${apt_options[@]}" update --error-on=any; then
-        echo 'Refresh signed Ubuntu ARM64 indexes for the device package dependencies'
-        inside apt-get "${apt_options[@]}" \
-            -o Dir::Etc::SourceList=/etc/apt/sources.list.d/system.sources \
-            -o Dir::Etc::SourceParts=- -o APT::Get::List-Cleanup=0 update --error-on=any
-    fi
-    rm -f -- "$apt_build_config"
+    refresh_apt
     install -d -m 0755 "$root$stage"
     requested=()
     while IFS= read -r name; do
         [[ $name =~ ^[a-zA-Z0-9._+-]+\.deb$ ]]
+        [[ $name != "$desktop_deb" ]] || continue
         install -m 0644 "$pool/$name" "$root$stage/$name"
         requested+=("$stage/$name")
     done < "$work/device-debs.txt"
@@ -154,6 +165,49 @@ if [[ ! -f $work/device-configured-v2 ]]; then
     touch "$work/device-configured-v2"
 fi
 
+echo '[Desktop] Install COSMIC rotation, Chinese Pinyin and the Android restart launcher'
+desktop_sha=$(sha256sum "$pool/$desktop_deb")
+if [[ $(cat "$work/desktop-deb.sha256" 2>/dev/null || :) != "${desktop_sha%% *}" ]] ||
+    [[ $(inside dpkg-query -W -f='${db:Status-Status}' popos-sheng-desktop 2>/dev/null || :) != installed ]]; then
+    install -Dm0644 "$pool/$desktop_deb" "$root$stage/$desktop_deb"
+    desktop_options=(--no-install-recommends --no-remove --reinstall -y install "$stage/$desktop_deb")
+    if ! inside apt-get "${apt_options[@]}" "${desktop_options[@]}"; then
+        refresh_apt
+        inside apt-get "${apt_options[@]}" "${desktop_options[@]}"
+    fi
+    rm -- "$root$stage/$desktop_deb"
+    rmdir "$root$stage"
+    printf '%s\n' "${desktop_sha%% *}" > "$work/desktop-deb.sha256"
+fi
+inside systemd-sysusers /usr/lib/sysusers.d/popos-sheng-desktop.conf
+inside usermod -aG sheng-rotation "$username"
+uid=$(inside id -u "$username")
+gid=$(inside id -g "$username")
+fcitx_home=$root/home/$username/.config/fcitx5
+install -d -m 0700 -o "$uid" -g "$gid" "$root/home/$username/.config" "$fcitx_home" "$fcitx_home/conf"
+for config in config profile conf/classicui.conf conf/pinyin.conf; do
+    if [[ ! -e "$fcitx_home/$config" ]]; then
+        install -m 0600 -o "$uid" -g "$gid" "$root/etc/skel/.config/fcitx5/$config" "$fcitx_home/$config"
+    fi
+done
+
+# Reused build caches must not carry a previous private calibration into a public image.
+rm -f -- "$root/usr/local/sbin/qbootctl-sheng" "$root/etc/qbootctl-sheng/boot.sha256"
+if [[ -n ${SHENG_POP_SLOT_BUNDLE:-} ]]; then
+    echo '[Desktop] Include the explicitly selected tablet calibration in this local image'
+    install -Dm0755 "$SHENG_POP_SLOT_BUNDLE/qbootctl-sheng" "$root/usr/local/sbin/qbootctl-sheng"
+    install -Dm0644 "$SHENG_POP_SLOT_BUNDLE/boot.sha256" "$root/etc/qbootctl-sheng/boot.sha256"
+    inside /usr/local/sbin/qbootctl-sheng --help >/dev/null 2>&1
+fi
+test -L "$root/usr/lib/systemd/system/sockets.target.wants/sheng-rotation-sensor.socket"
+for service in sheng-screen-rotation sheng-rotation-indicator fcitx5-cosmic; do
+    test -L "$root/usr/lib/systemd/user/cosmic-session.target.wants/$service.service"
+done
+grep -Fxq DefaultIM=pinyin "$fcitx_home/profile"
+test -x "$root/etc/xdg/Xwayland-session.d/20-fcitx-x11"
+test -s "$root/usr/share/fcitx5/themes/Sheng-Light/theme.conf"
+test -s "$root/usr/share/polkit-1/actions/com.xiaomi.sheng.reboot-android.policy"
+
 if [[ $mode == full ]]; then
     echo '[Image 3/4] Install and audit the newly compiled Sheng kernel beside COSMIC'
     read -r kernel_deb < "$work/kernel-deb.txt"
@@ -202,7 +256,8 @@ if [[ $mode == full ]]; then
     test ! -s "$output/dpkg-audit.txt"
     inside apt-get check
     packages=(cosmic-session cosmic-comp cosmic-greeter cosmic-settings mesa-vulkan-drivers pop-desktop upower tuned tuned-ppd \
-        v4l-utils libcamera-tools libspa-0.2-libcamera)
+        v4l-utils libcamera-tools libspa-0.2-libcamera fcitx5 fcitx5-pinyin \
+        fcitx5-frontend-gtk4 fcitx5-frontend-qt6 fonts-noto-cjk)
     while IFS= read -r name; do
         packages+=("$(dpkg-deb -f "$pool/$name" Package)")
     done < "$work/device-debs.txt"

@@ -139,7 +139,7 @@ jobs:
         run: |
           gzip -dc out/kernel/Image.gz > "$RUNNER_TEMP/sheng-Image"
           sudo python3 scripts/smoke-boot.py "$SHENG_POP_WORK/rootfs.ext4" \
-            "$RUNNER_TEMP/sheng-Image" "$(cat out/kernelrelease.txt)" --timeout 300 \
+            "$RUNNER_TEMP/sheng-Image" "$(cat out/kernelrelease.txt)" --timeout 300 --public \
             | tee out/qemu-smoke.log
 
       - name: Prepare and verify Release assets

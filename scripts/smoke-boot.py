@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("kernel", type=Path)
     parser.add_argument("release")
     parser.add_argument("--timeout", type=int, default=150)
+    parser.add_argument("--public", action="store_true", help="Check that no tablet-specific calibration is embedded")
     args = parser.parse_args()
     command = [
         "qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "max",
@@ -28,8 +29,17 @@ def main() -> None:
         b". /etc/os-release; "
         b"test -x /usr/bin/start-cosmic && test -x /usr/bin/cosmic-comp && "
         b"test -f /usr/share/wayland-sessions/cosmic.desktop && "
-        b"printf 'POP_SHENG_BOOT_OK %s %s\\n' \"$(uname -r)\" \"$VERSION_ID\"\n"
+        b"test -x /usr/bin/fcitx5 && test -x /usr/bin/sheng-screen-rotation && "
+        b"test -x /usr/libexec/sheng-rotation-indicator && "
+        b"test -x /usr/libexec/sheng-reboot-android && "
+        b"grep -Fxq DefaultIM=pinyin /etc/skel/.config/fcitx5/profile && "
     )
+    if args.public:
+        guest += (
+            b"test ! -e /usr/local/sbin/qbootctl-sheng && "
+            b"test ! -e /etc/qbootctl-sheng/boot.sha256 && "
+        )
+    guest += b"printf 'POP_SHENG_BOOT_OK %s %s\\n' \"$(uname -r)\" \"$VERSION_ID\"\n"
     expected = f"POP_SHENG_BOOT_OK {args.release} 26.04".encode()
     seen = b""
     sent = False

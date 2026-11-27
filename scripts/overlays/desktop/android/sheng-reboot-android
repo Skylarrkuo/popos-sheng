@@ -1,0 +1,91 @@
+#!/bin/bash
+set -euo pipefail
+export LC_ALL=C
+
+tool=/usr/local/sbin/qbootctl-sheng
+manifest=/etc/qbootctl-sheng/boot.sha256
+
+check_reboot_parameter() {
+    local parameter
+    parameter=$(/usr/bin/busctl --system get-property org.freedesktop.login1 \
+        /org/freedesktop/login1 org.freedesktop.login1.Manager RebootParameter)
+    if [[ "$parameter" != 's ""' ]]; then
+        echo "A different reboot target is pending. Android was not selected." >&2
+        return 1
+    fi
+}
+
+read_slot() {
+    local i slot
+    for i in 1 2 3 4 5; do
+        /usr/bin/udevadm settle --timeout=10 || return 1
+        if slot=$("$tool" -a 2>/dev/null); then
+            printf '%s\n' "$slot"
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "Cannot verify the selected slot after waiting for the disk links." >&2
+    return 1
+}
+
+if ((EUID != 0)); then
+    echo "Authentication is required to switch boot slots." >&2
+    exit 1
+fi
+if ! grep -zFxq xiaomi,sheng /sys/firmware/devicetree/base/compatible; then
+    echo "The Android restart action requires a Xiaomi Pad 6S Pro." >&2
+    exit 1
+fi
+if [[ ! -x $tool || ! -s $manifest ]]; then
+    echo "This tablet requires its verified A/B calibration before switching slots." >&2
+    exit 1
+fi
+if [[ $# == 1 && $1 == --check ]]; then
+    check_reboot_parameter
+    exec "$tool" --dry-run -s a
+fi
+if (($# != 0)); then
+    echo "This action does not accept a boot target." >&2
+    exit 1
+fi
+
+exec 9>/run/sheng-reboot-android.lock
+if ! /usr/bin/flock -n 9; then
+    echo "An Android switch is already in progress." >&2
+    exit 1
+fi
+
+check_reboot_parameter
+original=$(read_slot)
+case "$original" in
+    'Active slot: _b')
+        /usr/bin/systemd-inhibit --what=shutdown:sleep --mode=block \
+            --who='Sheng Android Switch' --why='Updating boot metadata' "$tool" -s a
+        ;;
+    'Active slot: _a')
+        ;;
+    *)
+        echo "Cannot confirm the original boot slot." >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$(read_slot)" == 'Active slot: _a' ]] &&
+   "$tool" --dry-run -s a &&
+   check_reboot_parameter &&
+   /usr/bin/systemctl reboot; then
+    exit 0
+fi
+
+echo "The Android reboot could not be started." >&2
+if [[ "$original" == 'Active slot: _b' ]]; then
+    if /usr/bin/systemd-inhibit --what=shutdown:sleep --mode=block \
+        --who='Sheng Android Switch' --why='Restoring boot metadata' "$tool" -s b &&
+       [[ "$(read_slot)" == 'Active slot: _b' ]]; then
+        echo "Pop!_OS slot B was restored and verified." >&2
+    else
+        echo "Could not verify recovery to slot B. Check the boot state before restarting." >&2
+    fi
+fi
+exit 1

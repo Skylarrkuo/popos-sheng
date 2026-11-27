@@ -1,0 +1,256 @@
+#!/usr/bin/python3
+import argparse
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+STATE = CONFIG / "sheng-screen-rotation" / "mode"
+SENSOR_SOCKET = "/run/sheng-rotation-sensor.sock"
+RANDR = "/usr/bin/cosmic-randr"
+LABELS = {
+    "normal": "横屏（前摄在上）",
+    "rotate90": "竖屏（前摄在右）",
+    "rotate180": "倒置横屏（前摄在下）",
+    "rotate270": "竖屏（前摄在左）",
+}
+MODES = ("auto", *LABELS)
+SSC_FRAME = re.compile(
+    rb"^Accelerometer sensor measurement: X=([-+0-9.]+) Y=([-+0-9.]+) Z=([-+0-9.]+)"
+)
+ANSI = re.compile(r"\x1b\[[\d;]*[a-zA-Z]")
+HEAD = re.compile(r"(?m)^DSI-[0-9]+ \(enabled\)[ \t]*$")
+TIMING = re.compile(r"\b([0-9]+)x([0-9]+)\s+@\s+([0-9.]+)\s+Hz\s+\(current\)")
+ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
+
+
+def read_mode():
+    try:
+        mode = STATE.read_text().strip()
+    except FileNotFoundError:
+        return "auto"
+    return mode if mode in MODES else "normal"
+
+
+def set_mode(mode):
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=STATE.parent, delete=False) as staged:
+        staged.write(mode + "\n")
+    os.replace(staged.name, STATE)
+
+
+def randr(*args):
+    result = subprocess.run([RANDR, *args], capture_output=True, text=True, timeout=5)
+    if result.returncode:
+        raise RuntimeError(ANSI.sub("", result.stderr or result.stdout).strip() or "cosmic-randr failed")
+    return ANSI.sub("", result.stdout)
+
+
+def display():
+    listing = randr("list")
+    panels = list(HEAD.finditer(listing))
+    if len(panels) != 1:
+        raise RuntimeError("Expected one enabled internal DSI display")
+    heading = panels[0]
+    block = re.split(r"(?m)^(?=\S)", listing[heading.end():], maxsplit=1)[0]
+    transform = re.search(r"(?m)^\s+Transform:\s+(\w+)\s*$", block)
+    timing = TIMING.search(block)
+    if not transform or not timing:
+        raise RuntimeError("COSMIC did not report the current DSI transform and mode")
+    return heading[0].split()[0], transform[1], timing.groups()
+
+
+def apply_rotation(wanted):
+    name, current, (width, height, refresh) = display()
+    if current == wanted:
+        return
+    args = ("mode", name, width, height, "--refresh", refresh, "--transform", wanted)
+    randr(*args, "--test")
+    randr(*args)
+    if display()[1] != wanted:
+        raise RuntimeError("COSMIC did not apply the requested transform")
+    print(f"{name}: {current} -> {wanted}", flush=True)
+
+
+def orientation(x, y, z):
+    # Calibration on Sheng: +X is normal landscape, +Y is camera-right portrait.
+    magnitude = math.hypot(x, y, z)
+    dominant = max(abs(x), abs(y))
+    secondary = min(abs(x), abs(y))
+    if not 7.5 <= magnitude <= 12.5 or dominant < 6.3 or dominant < 1.30 * secondary:
+        return None
+    if abs(x) > abs(y):
+        return "normal" if x > 0 else "rotate180"
+    return "rotate90" if y > 0 else "rotate270"
+
+
+def auto_rotate(last):
+    candidate = None
+    since = time.monotonic()
+    last_sample = since
+    retry_at = since
+    pending = b""
+    with socket.socket(socket.AF_UNIX) as sensor:
+        sensor.settimeout(0.35)
+        sensor.connect(SENSOR_SOCKET)
+        while read_mode() == "auto":
+            try:
+                chunk = sensor.recv(8192)
+                if not chunk:
+                    return last
+            except TimeoutError:
+                if time.monotonic() - last_sample > 8:
+                    raise RuntimeError("No accelerometer samples received")
+                candidate = None
+                continue
+            *lines, pending = (pending + chunk).split(b"\n")
+            for line in lines:
+                frame = SSC_FRAME.match(line)
+                if not frame:
+                    continue
+                now = time.monotonic()
+                target = orientation(*map(float, frame.groups()))
+                if target != candidate or now - last_sample > 0.4:
+                    candidate, since = target, now
+                last_sample = now
+                if target is None or target == last or now - since < 0.7 or now < retry_at:
+                    continue
+                if read_mode() != "auto":
+                    return last
+                try:
+                    apply_rotation(target)
+                    last = target
+                except ERRORS as error:
+                    print(f"Rotation deferred: {error}", file=sys.stderr, flush=True)
+                    retry_at = now + 3
+    return last
+
+
+def watch():
+    compatibles = Path("/sys/firmware/devicetree/base/compatible").read_bytes()
+    if b"xiaomi,sheng" not in compatibles.split(b"\0"):
+        raise RuntimeError("This accelerometer calibration requires Xiaomi Sheng")
+    previous = None
+    applied = None
+    while True:
+        mode = read_mode()
+        if mode != previous:
+            applied = None
+            previous = mode
+            print(f"Mode: {mode}", flush=True)
+        try:
+            if mode == "auto":
+                applied = auto_rotate(applied)
+            elif mode != applied:
+                apply_rotation(mode)
+                applied = mode
+        except ERRORS as error:
+            print(f"Rotation unavailable: {error}", file=sys.stderr, flush=True)
+            time.sleep(2)
+        time.sleep(0.35)
+
+
+def graphical():
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk
+
+    def activate(app):
+        if app.get_active_window():
+            app.get_active_window().present()
+            return
+        window = Gtk.ApplicationWindow(application=app, title="屏幕旋转")
+        window.set_default_size(382, 218)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        content.set_margin_start(22)
+        content.set_margin_end(22)
+        content.set_margin_top(20)
+        content.set_margin_bottom(20)
+        window.set_child(content)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        label = Gtk.Label(label="自动旋转", xalign=0, hexpand=True)
+        toggle = Gtk.Switch(valign=Gtk.Align.CENTER)
+        row.append(label)
+        row.append(toggle)
+        content.append(row)
+
+        direction_label = Gtk.Label(label="固定方向", xalign=0)
+        content.append(direction_label)
+        directions = Gtk.DropDown.new_from_strings(list(LABELS.values()))
+        content.append(directions)
+        message = Gtk.Label(xalign=0, wrap=True)
+        message.add_css_class("dim-label")
+        content.append(message)
+        updating = False
+
+        def refresh():
+            nonlocal updating
+            updating = True
+            mode = read_mode()
+            toggle.set_active(mode == "auto")
+            directions.set_sensitive(mode != "auto")
+            direction_label.set_sensitive(mode != "auto")
+            if mode != "auto":
+                directions.set_selected(list(LABELS).index(mode))
+            message.set_text("关闭自动旋转时会锁定当前方向。")
+            updating = False
+
+        def switch_changed(widget, _property):
+            if updating:
+                return
+            try:
+                mode = "auto" if widget.get_active() else display()[1]
+                if mode not in MODES:
+                    raise RuntimeError("当前屏幕方向无法锁定")
+                set_mode(mode)
+                refresh()
+            except ERRORS as error:
+                refresh()
+                message.set_text(str(error))
+
+        def direction_changed(widget, _property):
+            if not updating and read_mode() != "auto":
+                set_mode(list(LABELS)[widget.get_selected()])
+
+        refresh()
+        toggle.connect("notify::active", switch_changed)
+        directions.connect("notify::selected", direction_changed)
+        window.present()
+
+    app = Gtk.Application(application_id="org.sheng.ScreenRotation")
+    app.connect("activate", activate)
+    return app.run([])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Rotate the Xiaomi Sheng internal COSMIC display")
+    parser.add_argument("command", choices=("gui", "watch", "status", "lock", *MODES), nargs="?", default="gui")
+    command = parser.parse_args().command
+    if command == "gui":
+        return graphical()
+    if command == "watch":
+        watch()
+    elif command == "status":
+        print(f"mode={read_mode()} transform={display()[1]}")
+    else:
+        mode = display()[1] if command == "lock" else command
+        if mode not in MODES:
+            raise RuntimeError("The current transform cannot be locked")
+        set_mode(mode)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except ERRORS as error:
+        sys.exit(str(error))

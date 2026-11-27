@@ -1,0 +1,13 @@
+[Unit]
+Description=Read-only accelerometer stream for Sheng screen rotation
+
+[Socket]
+ListenStream=/run/sheng-rotation-sensor.sock
+SocketGroup=sheng-rotation
+SocketMode=0660
+Accept=yes
+MaxConnections=2
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

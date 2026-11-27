@@ -2,7 +2,8 @@
 param(
     [ValidateSet('Kernel','Configure','Rootfs','All')][string]$Stage = 'All',
     [string]$CosmicDeb,
-    [string]$CosmicDebSha256
+    [string]$CosmicDebSha256,
+    [string]$SlotBundle
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,13 @@ $env:WSL_UTF8 = '1'
 $Host.UI.RawUI.WindowTitle = 'Pop!_OS 26.04 COSMIC for Xiaomi Pad 6S Pro'
 $wslRepo = (& wsl.exe -d Ubuntu-24.04 -u root -- wslpath -a ($PSScriptRoot -replace '\\', '/')).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $wslRepo) { throw 'Unable to resolve the project in WSL' }
+$imageEnv = @()
+if ($SlotBundle) {
+    $bundlePath = (Resolve-Path -LiteralPath $SlotBundle).Path
+    $wslBundle = (& wsl.exe -d Ubuntu-24.04 -u root -- wslpath -a ($bundlePath -replace '\\', '/')).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $wslBundle) { throw 'Unable to resolve the private slot bundle in WSL' }
+    $imageEnv += "SHENG_POP_SLOT_BUNDLE=$wslBundle"
+}
 
 function Invoke-LinuxBuild([string]$Name, [string[]]$Arguments = @(), [string[]]$Environment = @()) {
     & wsl.exe -d Ubuntu-24.04 -u root -- env @Environment bash "$wslRepo/scripts/$Name" @Arguments
@@ -32,9 +40,9 @@ if ($Stage -in @('Configure','Rootfs','All')) {
     Invoke-LinuxBuild 'prepare-rootfs.sh'
     Invoke-LinuxBuild 'build-device-packages.sh'
     if ($Stage -eq 'Configure') {
-        Invoke-LinuxBuild 'build-image.sh' @('--configure-only')
+        Invoke-LinuxBuild 'build-image.sh' @('--configure-only') -Environment $imageEnv
     } else {
-        Invoke-LinuxBuild 'build-image.sh'
+        Invoke-LinuxBuild 'build-image.sh' -Environment $imageEnv
         Invoke-LinuxBuild 'publish-local-apt.sh'
     }
 }

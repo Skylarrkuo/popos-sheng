@@ -1,2 +1,4 @@
 * text=auto eol=lf
 *.patch whitespace=-blank-at-eol
+patches/qbootctl-sheng.patch whitespace=-blank-at-eol,-space-before-tab
+scripts/overlays/desktop/input/** whitespace=-blank-at-eof

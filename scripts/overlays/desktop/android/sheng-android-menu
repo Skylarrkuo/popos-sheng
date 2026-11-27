@@ -1,0 +1,94 @@
+#!/usr/bin/python3
+import os
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, Gtk
+
+TOOL = Path("/usr/local/sbin/qbootctl-sheng")
+MANIFEST = Path("/etc/qbootctl-sheng/boot.sha256")
+
+
+class RestartDialog(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.xiaomi.sheng.AndroidRestart")
+        self.window = None
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = Gtk.ApplicationWindow(application=self, title="重启到 Android")
+            self.window.set_default_size(426, -1)
+            self.window.set_resizable(False)
+
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            for edge in ("top", "bottom", "start", "end"):
+                getattr(content, f"set_margin_{edge}")(20)
+            self.window.set_child(content)
+
+            heading = Gtk.Label(label="重启到 Android？", xalign=0)
+            heading.add_css_class("title-2")
+            content.append(heading)
+            calibrated = os.access(TOOL, os.X_OK) and MANIFEST.is_file()
+            message = (
+                "平板将切换到 Android 的 A 槽并重启。\n请先保存正在编辑的内容。"
+                if calibrated else
+                "请先按照项目文档安装这台设备的 A/B 槽校准工具和启动分区校验清单。"
+            )
+            content.append(Gtk.Label(
+                label=message, xalign=0, wrap=True,
+            ))
+            self.status = Gtk.Label(xalign=0, wrap=True, selectable=True, visible=False)
+            content.append(self.status)
+
+            actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+            content.append(actions)
+            self.cancel = Gtk.Button(label="取消")
+            self.cancel.connect("clicked", lambda _button: self.quit())
+            actions.append(self.cancel)
+            self.confirm = Gtk.Button(label="重启到 Android")
+            self.confirm.add_css_class("destructive-action")
+            self.confirm.set_sensitive(calibrated)
+            self.confirm.connect("clicked", self.restart)
+            actions.append(self.confirm)
+            self.window.set_default_widget(self.cancel)
+
+        self.window.present()
+
+    def restart(self, _button):
+        self.confirm.set_sensitive(False)
+        self.cancel.set_sensitive(False)
+        self.window.set_deletable(False)
+        self.status.set_text("请完成管理员验证。验证后将检查启动分区。")
+        self.status.set_visible(True)
+        try:
+            task = Gio.Subprocess.new(
+                ["/usr/bin/pkexec", "--disable-internal-agent", "/usr/libexec/sheng-reboot-android"],
+                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_PIPE,
+            )
+            task.communicate_utf8_async(None, None, self.finished)
+        except GLib.Error as error:
+            self.show_error(error.message)
+
+    def finished(self, task, result):
+        try:
+            _, _, error = task.communicate_utf8_finish(result)
+            if task.get_successful():
+                self.quit()
+            elif task.get_if_exited() and task.get_exit_status() == 126:
+                self.show_error("已取消管理员验证。")
+            else:
+                self.show_error((error or "无法完成切换，请检查启动状态。").strip())
+        except GLib.Error as error:
+            self.show_error(error.message)
+
+    def show_error(self, message):
+        self.status.set_text(message)
+        self.cancel.set_sensitive(True)
+        self.confirm.set_sensitive(True)
+        self.window.set_deletable(True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(RestartDialog().run([]))

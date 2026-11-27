@@ -1,0 +1,22 @@
+[Desktop Entry]
+Name=Screen Rotation
+Name[zh_CN]=屏幕旋转
+Comment=Choose automatic rotation or lock a screen direction
+Comment[zh_CN]=选择自动旋转或锁定屏幕方向
+Exec=/usr/bin/sheng-screen-rotation gui
+Icon=object-rotate-right-symbolic
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+Keywords=rotation;display;orientation;旋转;横屏;竖屏;
+Actions=Auto;Lock;
+
+[Desktop Action Auto]
+Name=Automatic rotation
+Name[zh_CN]=自动旋转
+Exec=/usr/bin/sheng-screen-rotation auto
+
+[Desktop Action Lock]
+Name=Lock current direction
+Name[zh_CN]=锁定当前方向
+Exec=/usr/bin/sheng-screen-rotation lock
